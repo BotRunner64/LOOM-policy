@@ -8,13 +8,13 @@ from pathlib import Path
 import random
 import torch
 from .data import ManifestDataset, SamplingConfig
-from .model import LoomPolicy, ModelConfig, masked_loss
+from .model import LoomPolicy, ModelConfig
 
 
 def load_checkpoint(path, device="cpu"):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if checkpoint.get("format_version") != 1:
-        raise ValueError("Unsupported LOOM checkpoint")
+    if checkpoint.get("format_version") != 2:
+        raise ValueError("Expected a LOOM flow-matching checkpoint (format_version=2)")
     return checkpoint
 
 
@@ -85,13 +85,13 @@ def train(config, resume=None, steps_override=None):
 
     def checkpoint():
         save_checkpoint(output / "last.pt", {
-            "format_version": 1, "step": step, "epoch": epoch, "cursor": cursor,
+            "format_version": 2, "step": step, "epoch": epoch, "cursor": cursor,
             "model_config": asdict(model_config), "sampling_config": asdict(sampling),
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "train_settings": settings, "manifest_sha256": manifest_hash,
             "torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
             "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
-            "semantics": "state26-step-body/action20-chunk-body-rot6d/future-observed-state-v1",
+            "semantics": "conditional-flow-matching/state26-step-body/action20-chunk-body-rot6d",
         })
 
     try:
@@ -105,8 +105,7 @@ def train(config, resume=None, steps_override=None):
             batch = [data[i] for i in indices]
             model.train()
             optimizer.zero_grad(set_to_none=True)
-            predictions = model([s["input"] for s in batch])
-            loss = masked_loss(predictions, batch)
+            loss = model.flow_matching_loss(batch)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite loss")
             loss.backward()
@@ -120,9 +119,10 @@ def train(config, resume=None, steps_override=None):
                 with torch.no_grad():
                     # Evaluate the complete supplied validation manifest.
                     losses = []
+                    generator = torch.Generator(device=device).manual_seed(settings.get("validation_seed", 0))
                     for i in range(len(validation)):
                         sample = validation[i]
-                        losses.append(float(masked_loss(model([sample["input"]]), [sample])))
+                        losses.append(float(model.flow_matching_loss([sample], generator=generator)))
                 record["validation_loss"] = sum(losses) / len(losses)
             with (output / "metrics.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")

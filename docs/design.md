@@ -24,9 +24,19 @@ instruction 在 `start_ns` 到达时成为一个文本事件；目标 query 之�
 
 LOOM-data 不记录 action。每个 future offset 使用该时刻已到达的最近实测状态作监督，并记录显式 staleness/episode-end mask；不会读取指定时刻之后的样本或超出流末尾延拓。左右 EEF 都相对 **同一 query 时刻各自的观测锚点** 编码为 `T_query^-1 @ T_future`，不在 horizon 内累乘动作。
 
-每臂 10 维：`[translation3,rotation_column0_3,rotation_column1_3,openness1]`，双臂总 20 维，左臂在前。用 MSE 对有效字段回归；位置单位为米，旋转是前两列的 6D 表示，夹爪是绝对开合程度。无效字段虽然存储成零，loss 从布尔 mask 选择有效字段，零值不参与监督。没有使用未来动作、未来图像/状态或 teacher forcing 输入。
+每臂 10 维：`[translation3,rotation_column0_3,rotation_column1_3,openness1]`，双臂总 20 维，左臂在前。位置单位为米，旋转是前两列的 6D 表示，夹爪是绝对开合程度。动作块作为 flow matching 的数据端点；未来图像/状态不会作为观测事件输入。
 
 推理以 Gram-Schmidt 把预测 6D 旋转映射到 SO(3)，退化向量有确定性正交基兜底，夹爪裁剪到 `[0,1]`；再乘对应 EEF 的 query anchor 还原成导出格式绝对 pose12。此处是数学反变换，不包含机器人限位、控制周期、碰撞处理或实际下发。
+
+## Conditional flow matching head
+
+动作头由用户确定采用 flow matching。使用 [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747) 的条件速度场训练框架，选择高斯噪声到动作的直线路径：每个样本采样 `z ~ N(0,I)`、一个整块共享的 `t ~ Uniform[0,1)`，构造 `x_t=(1-t)z+t*a`，目标速度 `u=a-z`。这里 `t` 是无量纲生成进度，与真实观测秒数和未来动作 offsets 完全独立。
+
+`FlowMatchingHead` 把每个 horizon 的带噪动作 `x_t[h]` 线性映射为 D 维，加上 Fourier flow-time 特征经 MLP 的输出和可学习 query bias。再加物理 query 元数据后，与所有观测 token 进入同一个共享 Transformer，最后将每个 query hidden state 映射为 20 维速度 `v_theta(obs,x_t,t)`。整个 action chunk 可相互注意，学习联合分布。
+
+训练最小化有效字段上的 `MSE(v_theta,u)`。无效字段在构造带噪条件之前即以独立噪声代替，令该字段 `x_t=z`，不作为速度监督；无效字段中的零值或 NaN 不会经注意力污染其他字段。这是局部缺失监督的处理约定，尚需真实数据评估其效果。
+
+推理 `sample_actions` 从新的高斯 action chunk 开始，以 `t=0` 到 `t=1` 做显式 Euler 积分：`x <- x + v_theta(obs,x,t)/N`，默认 N=10，可配置 `flow_steps` 或 CLI `--flow-steps`。积分期间不读取标签或监督 mask；固定 seed 或 initial_noise 可复现采样。采样要求 `eval()`，避免 dropout 和随机 ID 在 ODE 各步变化。最终才做 SO(3) 映射和夹爪裁剪，中间速度场在欧氏 action20 空间中求解。
 
 ## 统一 token 与可见性
 
@@ -36,14 +46,14 @@ LOOM-data 不记录 action。每个 future offset 使用该时刻已到达的最
 - 所有 token 都加同一个元数据 MLP 输出，输入 `[tau,x,y,has_xy,E_segment,E_stream,E_modality]`。
 - 目标段 `tau = event_time-query.time`；参考段相对最后可见事件归零。单位为秒，不按段长度归一化，没有固定最大秒数。模型不做 KV cache，避免锚点移动引起旧缓存无效。
 - ID 是每样本局部类别标签，stream 仅在段内区分来源。训练默认随机重编号 segment/stream，避免模型依赖固定的“参考=0/目标=1”等标签。类别表容量可配，超出报错，不映射到机器人身份。
-- 每个 future offset 产生一个动作查询 token，使用目标 segment、独立 query stream、action modality 和相对未来秒数；只有可学习 query 内容，不包含真实未来动作。
+- 每个 future offset 产生一个动作查询 token，使用目标 segment、独立 query stream、action modality 和相对未来秒数；内容为当前带噪动作和 flow time 的映射。
 
 数据适配器先裁掉目标未来，模型公开入口也再次在任意混合层之前裁掉 query 之后的目标事件。参考可完整提供，因为它属于另一个物理轨迹。相同 `source_id` 不能以不同 segment 重复出现；但客户端若谎报来源，模型无法自行识别，调用方必须保留真实物理来源。
 
-过滤后所有 token 进入一个标准全注意力 TransformerEncoder；观测和 query 可相互注意，query 之间也可注意，但没有 future ground truth，所以训练和推理可见信息相同。batch 内不同样本有 padding mask，彼此隔离。无 context/current 专用分支，无视觉/时间专用注意力机制。
+过滤后所有 token 进入一个标准全注意力 TransformerEncoder；观测和 query 可相互注意，query 之间也可注意。训练中的动作 query 是按条件路径构造的 `x_t`；推理中则是 ODE 当前状态，网络两阶段都接收 `(obs,x_t,t)`。未来监督只用于路径和速度目标，不作为额外观测或干净答案注入。batch 内不同样本有 padding mask，彼此隔离。无 context/current 专用分支，无视觉/时间专用注意力机制。因为观测 hidden states 也会依赖 `x_t,t`，每个 ODE step 都运行主干，不复用跨 step 的观测 KV。
 
 ## 预算、范围与后续研究
 
 采样器默认每相机 4 帧、32 个 state 事件，均匀选取并保留末端；`null` 可取消对应数量预算。是显式采样策略，不是主干固定时间窗。`max_tokens` 仅作为显存保护上限，超过直接报错，不静默截断文本或参考。模型支持不同 segment 数、不同模态、异步时间和不同 horizon；可靠跨度和跨域能力仍依赖训练数据。
 
-待研究项包括回归头与 flow/diffusion 的比较、语言输入映射、query/observation 注意力形式、源 ID 增广、采样策略、长序列计算、在线缓存以及大规模分布式训练。当前代码把这些选择保持为局部实现，不把尚未验证的假设写成实验结论。
+待研究项包括 flow 采样步数、语言输入映射、query/observation 注意力形式、源 ID 增广、采样策略、长序列计算、在线缓存以及大规模分布式训练。当前代码不把尚未验证的假设写成实验结论。

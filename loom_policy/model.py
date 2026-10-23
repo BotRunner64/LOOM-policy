@@ -1,14 +1,14 @@
 """Shallow content maps + shared metadata MLP + one Transformer.
 
-Observation events are filtered before *any* mixing layer. Thus a standard
-bidirectional encoder is safe: every observation/query token has the same
-information available in training and inference, and labels never enter it.
+Observation events are filtered before *any* mixing layer. Action queries
+contain the flow state x_t and flow time, never future observation events.
 """
 from dataclasses import dataclass
 import math
 import torch
 from torch import nn
 from .events import PolicyInput
+from .flow import FlowMatchingHead, conditional_path, masked_velocity_loss
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,7 @@ class ModelConfig:
     max_streams: int = 32
     max_tokens: int = 4096
     randomize_ids: bool = True
+    flow_steps: int = 10
 
     def __post_init__(self):
         if any(x < 1 for x in (self.d_model, self.heads, self.layers, self.mlp_ratio,
@@ -30,6 +31,8 @@ class ModelConfig:
             raise ValueError("Model sizes and token budget must be positive")
         if self.d_model % self.heads or not 0 <= self.dropout < 1:
             raise ValueError("d_model must be divisible by heads; dropout must be in [0,1)")
+        if type(self.flow_steps) is not int or self.flow_steps < 1:
+            raise ValueError("flow_steps must be a positive integer")
 
 
 def text_positions(length, width, device, dtype):
@@ -59,11 +62,10 @@ class LoomPolicy(nn.Module):
         self.stream = nn.Embedding(c.max_streams, d)
         self.modality = nn.Embedding(4, d)  # image, state, text, action query
         self.meta = nn.Sequential(nn.Linear(4 + 3 * d, d), nn.GELU(), nn.Linear(d, d))
-        self.action_query = nn.Parameter(torch.randn(d) * 0.02)
+        self.flow_head = FlowMatchingHead(d, self.action_dim)
         layer = nn.TransformerEncoderLayer(d, c.heads, c.mlp_ratio * d, c.dropout,
                                           batch_first=True, norm_first=True, activation="gelu")
         self.backbone = nn.TransformerEncoder(layer, c.layers, nn.LayerNorm(d), enable_nested_tensor=False)
-        self.action = nn.Linear(d, self.action_dim)
         # TransformerEncoder otherwise clones identical initial layer weights.
         for module in self.backbone.modules():
             if isinstance(module, nn.Linear):
@@ -79,9 +81,13 @@ class LoomPolicy(nn.Module):
                                    self.stream.weight[stream].expand(n, -1),
                                    self.modality.weight[modality].expand(n, -1)), dim=-1))
 
-    def tokenize(self, inputs: PolicyInput):
+    def tokenize(self, inputs: PolicyInput, noisy_actions, flow_time):
         c = self.config
-        device, dtype = self.action_query.device, self.action_query.dtype
+        device, dtype = self.flow_head.query_bias.device, self.flow_head.query_bias.dtype
+        noisy_actions = torch.as_tensor(noisy_actions, device=device, dtype=dtype)
+        if noisy_actions.shape != (len(inputs.query.offsets), self.action_dim):
+            raise ValueError("Noisy action horizon must match query offsets")
+        query_content = self.flow_head.condition(noisy_actions, flow_time)
         segments = inputs.visible()
         if len(segments) > c.max_segments:
             raise ValueError("Too many segments; increase max_segments")
@@ -148,37 +154,68 @@ class LoomPolicy(nn.Module):
                 target_sid = sid
                 query_stream = stream_ids[-1]
         start = count
-        for offset in inputs.query.offsets:
-            append(self.action_query[None], offset, None, target_sid, query_stream, 3)
+        for h, offset in enumerate(inputs.query.offsets):
+            append(query_content[h:h + 1], offset, None, target_sid, query_stream, 3)
         return torch.cat(pieces), slice(start, count)
 
-    def forward(self, inputs: list[PolicyInput]):
+    def forward(self, inputs: list[PolicyInput], noisy_actions, flow_times):
+        """Predict velocity, not clean actions, at the supplied flow state."""
         if not inputs:
             raise ValueError("Empty batch")
-        tokenized = [self.tokenize(sample) for sample in inputs]
+        if len(noisy_actions) != len(inputs) or len(flow_times) != len(inputs):
+            raise ValueError("One noisy chunk and flow time are required per sample")
+        tokenized = [self.tokenize(sample, noisy, time)
+                     for sample, noisy, time in zip(inputs, noisy_actions, flow_times, strict=True)]
         longest = max(len(tokens) for tokens, _ in tokenized)
-        tokens = self.action_query.new_zeros(len(inputs), longest, self.config.d_model)
+        tokens = self.flow_head.query_bias.new_zeros(len(inputs), longest, self.config.d_model)
         padding = torch.ones((len(inputs), longest), device=tokens.device, dtype=torch.bool)
         for i, (value, _) in enumerate(tokenized):
             tokens[i, :len(value)] = value
             padding[i, :len(value)] = False
         hidden = self.backbone(tokens, src_key_padding_mask=padding)
-        return [self.action(hidden[i, span]) for i, (_, span) in enumerate(tokenized)]
+        return [self.flow_head.velocity(hidden[i, span]) for i, (_, span) in enumerate(tokenized)]
 
+    def flow_matching_loss(self, samples, generator=None):
+        """One uniformly sampled flow time per complete action chunk."""
+        if not samples:
+            raise ValueError("Empty batch")
+        parameter = self.flow_head.query_bias
+        noisy, velocities, masks, times = [], [], [], []
+        for sample in samples:
+            target = sample["target"].to(parameter)
+            mask = sample["mask"].to(device=parameter.device, dtype=torch.bool)
+            noise = torch.randn(target.shape, device=parameter.device, dtype=parameter.dtype, generator=generator)
+            time = torch.rand((), device=parameter.device, dtype=parameter.dtype, generator=generator)
+            state, velocity = conditional_path(target, mask, noise, time)
+            noisy.append(state)
+            velocities.append(velocity)
+            masks.append(mask)
+            times.append(time)
+        predictions = self([sample["input"] for sample in samples], noisy, times)
+        return masked_velocity_loss(predictions, velocities, masks)
 
-def masked_loss(predictions, samples):
-    """Unobserved/stale future fields contribute no gradients."""
-    total = predictions[0].new_zeros(())
-    count = 0
-    for pred, sample in zip(predictions, samples, strict=True):
-        target = sample["target"].to(pred)
-        mask = sample["mask"].to(device=pred.device, dtype=torch.bool)
-        if target.shape != pred.shape or mask.shape != pred.shape:
-            raise ValueError("Target/mask shape must match [H,20]")
-        if not torch.isfinite(target[mask]).all():
-            raise ValueError("Nonfinite supervised target")
-        total = total + (pred[mask] - target[mask]).square().sum()
-        count += int(mask.sum())
-    if count == 0:
-        raise ValueError("No supervised action fields")
-    return total / count
+    @torch.no_grad()
+    def sample_actions(self, inputs, *, steps=None, generator=None, initial_noise=None):
+        """Euler-integrate dx/dt=v_theta(obs,x,t) from Gaussian t=0 to t=1."""
+        if self.training:
+            raise ValueError("Call model.eval() before flow sampling")
+        steps = self.config.flow_steps if steps is None else steps
+        if type(steps) is not int or steps < 1:
+            raise ValueError("Flow sampling steps must be a positive integer")
+        if not inputs or (initial_noise is not None and len(initial_noise) != len(inputs)):
+            raise ValueError("Sampling needs inputs and one initial noise chunk per sample")
+        parameter = self.flow_head.query_bias
+        state = []
+        for i, sample in enumerate(inputs):
+            shape = (len(sample.query.offsets), self.action_dim)
+            noise = (torch.randn(shape, device=parameter.device, dtype=parameter.dtype, generator=generator)
+                     if initial_noise is None else torch.as_tensor(initial_noise[i], device=parameter.device, dtype=parameter.dtype).clone())
+            if noise.shape != shape or not torch.isfinite(noise).all():
+                raise ValueError("Initial noise must be finite and match [H,20]")
+            state.append(noise)
+        for i in range(steps):
+            velocity = self(inputs, state, [i / steps] * len(inputs))
+            state = [x + v / steps for x, v in zip(state, velocity, strict=True)]
+        if any(not torch.isfinite(x).all() for x in state):
+            raise FloatingPointError("Nonfinite flow sample")
+        return state

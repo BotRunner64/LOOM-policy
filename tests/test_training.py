@@ -22,10 +22,13 @@ def test_checkpoint_resume_exact_optimizer_data_rng_and_prediction(manifest, tmp
     checkpoint = train(resumed_config, resume=partial)
     a, b = load_checkpoint(full), load_checkpoint(checkpoint)
     assert a["step"] == b["step"] == 6
+    assert b["format_version"] == 2
     assert a["epoch"] == b["epoch"] and a["cursor"] == b["cursor"]
     for key in a["model"]:
         torch.testing.assert_close(a["model"][key], b["model"][key], atol=0, rtol=0)
-    result = predict(checkpoint, manifest)
+    result = predict(checkpoint, manifest, steps=3, seed=27)
+    assert result["flow_steps"] == 3 and result["seed"] == 27
+    assert result == predict(checkpoint, manifest, steps=3, seed=27)
     assert np.asarray(result["relative_actions"]).shape == (3, 20)
     from loom_policy.geometry import pose_to_matrix
     assert pose_to_matrix(result["absolute_targets"]["left_eef"]).shape == (3, 4, 4)
