@@ -1,0 +1,17 @@
+{
+  "manifest": "../runs/train.jsonl",
+  "output": "../runs/baseline",
+  "model": {
+    "d_model": 128, "heads": 4, "layers": 4, "mlp_ratio": 4,
+    "patch_size": 16, "max_tokens": 4096, "randomize_ids": true
+  },
+  "sampling": {
+    "image_size": [64, 64], "max_image_frames": 4,
+    "max_state_events": 32, "max_age_ns": 250000000
+  },
+  "train": {
+    "device": "cpu", "cpu_threads": 2, "batch_size": 2,
+    "steps": 1000, "lr": 0.0003, "weight_decay": 0.01,
+    "grad_clip": 1.0, "save_every": 100, "seed": 7
+  }
+}
