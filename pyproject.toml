@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loom-policy"
+version = "0.2.0"
+description = "Unified event-token robot policy with conditional flow matching"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.2", "numpy>=1.24", "pyarrow>=15", "av>=12", "pillow>=10"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+loom-train = "loom_policy.train:main"
+loom-predict = "loom_policy.predict:main"
+
+[tool.setuptools.packages.find]
+include = ["loom_policy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
