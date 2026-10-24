@@ -1,20 +1,25 @@
 # LOOM-policy
 
-图像、state、文本观测与固定 action 输出 token 一起经过共享 Transformer，动作 token 的 hidden states 经共享 MLP 直接回归当前时刻往后的双臂 action chunk。参考和当前轨迹共用输入映射与主干。
+图像经过小型 ViT、文本经过小型 BERT 式 encoder，保留完整 token 序列；state 经 MLP，随后与固定 action 输出 token 一起经过共享 Transformer，动作 token 的 hidden states 经共享 MLP 直接回归当前时刻往后的双臂 action chunk。参考和当前轨迹共用输入映射与主干。
 
 ```text
 参考观测 + 当前轨迹截至 t 的观测
-        ↓ 浅层映射 + 共享元数据 MLP
-观测 token + H 个 action 输出 token（每个时间步1个）
-        ↓ 共享 Transformer（一次前向，全注意力）
-取 action hidden states → [H,D]
-        ↓ 逐步应用共享残差 MLP：D → 20
-[H,20] chunk-wise relative 动作
-        ↓ SO(3) 投影 + 双臂当前位姿锚点
+  图像 → 小型 ViT：patch映射 + 2D位置编码 + 2层自注意力
+  文本 → 小型 BERT式encoder：字节/位置Embedding + 2层双向注意力
+  state → MLP
+        ↓ 保留各patch/文本token，加共享metadata
+观测 token + H个action token → 4层共享Transformer
+        ↓ 取action hidden states [H,D]
+共享残差 MLP → [H,20] 动作块
+        ↓ SO(3)投影 + 当前位姿锚点
 双臂绝对目标位姿 + 夹爪开合
 ```
 
 采用并行 action token 读出与 L1 回归：每个未来时间步一个固定输出 token，默认8步共8个。token 内不输入真实动作，只由固定位置编码区分时间步；每个 hidden state 经同一个 MLP 输出该步完整的20维动作。借鉴 [OpenVLA-OFT](https://github.com/moojink/openvla-oft) 的并行连续回归，不沿用其每维一个 token 的布局。没有观测池化、带噪动作、采样循环或可变未来时间查询。
+
+所有网络随机初始化、端到端训练，不加载或下载预训练权重。ViT为pre-LN/GELU结构，BERT式文本encoder为post-LN/GELU结构；默认各2层、D=128、4 heads、FFN=512。参考和当前观测共用同一套模态encoder。没有CLS或池化，输入token数量保持不变。
+
+文本仍使用UTF-8字节词表（256项），每字节一个token，使用可学习位置Embedding；它是BERT式架构，不使用WordPiece、预训练语言知识或MLM/NSP头。`max_text_tokens=512`限制单个文本事件的字节数，超限报错，不静默截断。
 
 ## 安装
 
@@ -57,7 +62,7 @@ manifest 每行只有数据来源、当前截止时刻和参考，不携带输�
 {"dataset":"/path/to/export","episode_id":"episode_0002","time_ns":1000000000,"references":[{"episode_id":"episode_0001"}]}
 ```
 
-参考可指定不同 `dataset` 和可选 `end_ns`。配置和 manifest 的相对路径分别相对各自文件所在目录解析。可在配置加 `validation_manifest`，所有训练/验证物理源（含参考）必须隔离。checkpoint v5 原子保存模型、优化器、数据游标、epoch 与 RNG；`--steps` 为包含恢复步数的总训练步数。训练及验证指标均为有效动作字段的 L1。
+参考可指定不同 `dataset` 和可选 `end_ns`。配置和 manifest 的相对路径分别相对各自文件所在目录解析。可在配置加 `validation_manifest`，所有训练/验证物理源（含参考）必须隔离。checkpoint v6 原子保存模型、优化器、数据游标、epoch 与 RNG；`--steps` 为包含恢复步数的总训练步数。训练及验证指标均为有效动作字段的 L1。
 
 ## 模型接口
 

@@ -1,4 +1,4 @@
-"""LOOM's per-timestep action-token regression policy."""
+"""LOOM's random-init ViT/BERT policy with per-timestep action regression."""
 from .events import Event, Segment, ChunkConfig, PolicyInput
 from .model import LoomPolicy, ModelConfig
 
