@@ -1,88 +1,82 @@
 # LOOM-policy
 
-LOOM 的统一事件序列策略：图像 patch、step-wise relative state、UTF-8 文本和带噪动作查询，经共享元数据 MLP 编码后进入同一个 Transformer，以 **conditional flow matching head** 生成 chunk-wise relative 双臂动作块。
+只输入图像、state、文本观测，经共享 Transformer 后，直接回归当前时刻往后的固定长度双臂 action chunk。参考和当前轨迹共用输入映射与主干。
 
-实现依据是 [Notion LOOM-policy](https://app.notion.com/p/3f90249b500e80999eebe508023adde0) 中 **2026-10-22 的 `loom-policy-design-v2.html`**，以及相邻 `LOOM-data/docs/contract/export-contract.md`。已废弃的 context/current 双分支、高压缩 encoder、CLS 等结构不在此实现中。
+```text
+参考观测 + 当前轨迹截至 t 的观测
+        ↓ 浅层映射 + 共享元数据 MLP
+统一观测 token 序列 → 共享 Transformer（一次前向）
+        ↓ 当前轨迹 token 的 hidden states 平均池化
+小 MLP → [H,20] chunk-wise relative 动作
+        ↓ SO(3) 投影 + 双臂当前位姿锚点
+双臂绝对目标位姿 + 夹爪开合
+```
 
-动作头按用户指定采用 flow matching：训练拟合从高斯噪声到动作块的速度场，推理从噪声经 ODE 积分生成动作。UTF-8 byte 文本映射、时间锚点及异步 state 合并仍是明确的实现选择。尚无真实数据训练收敛、跨域适配或机器人任务成功率结论。
+采用类似 [OpenVLA-OFT](https://github.com/moojink/openvla-oft) 的并行连续动作块与 L1 目标。OFT 自身仍使用动作输出 token；本实现按用户要求进一步简化为观测表示直接读出整个动作块，不是 OFT 的逐项复现。没有动作 token、带噪动作、采样循环或可变未来时间查询。
 
 ## 安装
 
 ```bash
 conda env create -f environment.yml
 conda activate loom-policy
-```
-
-也可在已有 Python >=3.11 环境安装：
-
-```bash
+# 或已有 Python >=3.11 环境：
 python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-仅需 PyTorch、NumPy、PyArrow、PyAV、Pillow；不下载预训练权重，不依赖 LOOM-data 的 Python 源码或源数据集内部字段。
+## 数据与输出时序
 
-## 数据 → 训练 → 恢复 → 推理
+只消费相邻 `LOOM-data/docs/contract/export-contract.md` 的正式导出格式：`episodes.jsonl`、四路异步 state Parquet、逐相机 H.264 MP4/时间索引。不依赖单个源数据集字段。
 
-数据根目录必须是 LOOM-data 正式导出格式（`episodes.jsonl`、四路 state Parquet、逐相机 MP4/Parquet）。**没有 action 列**；本实现用未来实测 EEF/夹爪状态构造监督。这是未来观测轨迹的行为克隆代理目标，不是源控制器实际下发的指令。
+输出长度和周期固定在模型配置中，默认 `chunk_size=8`、`action_interval_ns=50000000`。在当前时刻 t，预测 t+Δt 到 t+HΔt 的目标；数据没有 action，标签由未来实测 EEF/夹爪构造。第一项对应下一个控制步的目标，不是把当前观测原样复制为第一个动作。
 
-先按物理 episode 划分训练和验证，再分别创建 query manifest；不要随机拆同一 episode 的窗口。可用 `--episodes` 明确选择目标集，用 `--references` 提供固定示例（会从目标集中排除）。
+各臂 EEF 使用自己的当前观测锚点，输出 chunk 内共享锚点。每臂为位置3、旋转6D、夹爪1，共20维；输入 state 为 step-wise body-relative 双臂 pose12 与实际夹爪，共26维。缺失/过期/超出流末尾的标签字段以 loss mask 排除。
+
+“截至 t”只是输入取样规则：当前轨迹未来图像/state 不输入，未来实测值只制作标签；不需要专门的未来信息网络模块。参考轨迹可以完整提供，但不能把当前轨迹未来部分重标为参考。
+
+## 索引、训练、恢复、预测
+
+先按物理 episode 划分训练和验证，再分别生成索引。参考用 `--references` 指定并从目标集中排除。索引和训练使用同一配置读取输出时序：
 
 ```bash
-python -m loom_policy.index \
+python -m loom_policy.index --config configs/baseline.json \
   --dataset /inspire/hdd/global_user/czxs253130598/path/to/export \
-  --output runs/train.jsonl --episodes episode_0001 episode_0002 \
-  --stride 16 --horizon 8 --dt-ns 50000000
-
-# configs/baseline.json 默认读取 runs/train.jsonl，输出 runs/baseline/
+  --output runs/train.jsonl --episodes episode_0001 episode_0002 --stride 16
 python -m loom_policy.train --config configs/baseline.json
 python -m loom_policy.train --config configs/baseline.json \
   --resume runs/baseline/last.pt --steps 2000
-
 python -m loom_policy.predict --checkpoint runs/baseline/last.pt \
-  --manifest runs/train.jsonl --index 0 --flow-steps 10 --seed 0 \
-  --output runs/prediction.json
+  --manifest runs/train.jsonl --index 0 --output runs/prediction.json
 ```
 
-配置和 manifest 中的相对路径分别相对该 JSON/JSONL 文件目录解析。配置可加 `validation_manifest`；训练和验证的物理 episode（含参考）重叠时会拒绝启动。`--steps` 是包含已恢复步数的总训练步数。checkpoint 保存模型、优化器、样本游标、epoch 和随机数状态，原子替换 `last.pt`。CPU 测试覆盖中途恢复与连续训练逐参数一致；GPU 恢复没有逐位一致性保证。只加载自己产生或可信来源的 checkpoint。
-
-默认是单进程 CPU 调试配置。GPU 单卡改 `train.device` 为 `cuda`，并按资源预算调整图像尺寸、patch、层数和 batch；代码尚不提供 DDP/FSDP、在线 KV cache 或机器人实时执行器。正式大训练应在低优先级 Job 中调用训练命令并将输出放在共享盘，以 checkpoint 恢复；本仓库不会自动申请集群资源。
-
-训练 loss 和 `validation_loss` 都是 masked conditional flow-matching velocity MSE。验证使用独立固定种子的噪声和 flow time，避免消耗训练 RNG。推理 `--flow-steps` 控制 Euler 积分步数，缺省取模型配置 `flow_steps=10`；固定 `--seed` 可复现初始噪声。Checkpoint 格式为 v2，只支持当前 flow matching 模型。
-
-## Manifest
-
-每行显式描述一次 query，时间均为原始 episode 共同 clock 下的 int64 纳秒：
+manifest 每行只有数据来源、当前截止时刻和参考，不携带输出查询：
 
 ```json
-{"dataset":"/path/to/export","episode_id":"episode_0002","query_time_ns":1000000000,"offsets_ns":[50000000,100000000],"references":[{"episode_id":"episode_0001"}]}
+{"dataset":"/path/to/export","episode_id":"episode_0002","time_ns":1000000000,"references":[{"episode_id":"episode_0001"}]}
 ```
 
-参考可提供不同 `dataset` 和可选 `end_ns`，缺省为参考 episode 末端。目标 episode 不能作为任何参考重新引入。末端不足完整 horizon 的字段以 loss mask 忽略，不零填为监督，不做越界外推。`max_age_ns` 限制 backward-as-of 查询允许的陈旧程度。indexer 自动跳过锚点缺失或完全没有未来监督的 query；直接编写 manifest 时这些问题会报错。
+参考可指定不同 `dataset` 和可选 `end_ns`。配置和 manifest 的相对路径分别相对各自文件所在目录解析。可在配置加 `validation_manifest`，所有训练/验证物理源（含参考）必须隔离。checkpoint v3 原子保存模型、优化器、数据游标、epoch 与 RNG；`--steps` 为包含恢复步数的总训练步数。训练及验证指标均为有效动作字段的 L1。
 
-## 公开模型接口
+## 模型接口
 
 ```python
 import torch
-from loom_policy import Event, Segment, Query, PolicyInput, LoomPolicy
+from loom_policy import Event, Segment, PolicyInput, LoomPolicy
 
 inputs = PolicyInput(
-    segments=[
-        Segment("goal", "goal-image-source", [
-            Event(0.0, "cam", "image", torch.rand(3, 64, 64))]),
-        Segment("target", "live-physical-trajectory", [
-            Event(1.0, "cam", "image", torch.rand(3, 64, 64)),
-            Event(0.0, "instruction", "text", "把方块放进盒子")])],
-    query=Query("target", 1.0, (0.05, 0.10)))
+    current=Segment("current", "live-episode", [
+        Event(1.0, "cam", "image", torch.rand(3, 64, 64)),
+        Event(0.0, "instruction", "text", "把方块放进盒子")]),
+    time=1.0,
+    references=[Segment("goal", "goal-image", [
+        Event(0.0, "cam", "image", torch.rand(3, 64, 64))])])
 model = LoomPolicy().eval()
 with torch.no_grad():
-    actions = model.sample_actions(
-        [inputs], generator=torch.Generator().manual_seed(0))[0]  # [2,20]
-    # 未训练模型，只展示接口
+    actions = model([inputs])  # [batch=1, chunk_size=8, action_dim=20]
 ```
 
-`Segment` 可以只有图像、文本或 state；缺失模态不产生 token。目标历史就是目标段更早的事件。不同物理轨迹需要不同 `source_id`，同一物理轨迹必须复用同一 ID，调用方须保留真实来源，不能通过改名绕过可见性。数据适配器使用 resolved episode 路径作为来源。视频示例、goal image 可以直接经此接口提供；标准导出适配器仍严格要求契约中的四路 state 与至少一个相机。
+缺失模态不产生 token。`current` 和 `time` 是当前预测的观测边界，不会生成额外 token。参数未经训练时，上例只展示接口。推理只需一次前向，输出确定；没有噪声、采样步数或随机 seed 参数。
 
-底层 `model(inputs, noisy_actions, flow_times)` 返回 `[H,20]` **速度场**；训练用 `model.flow_matching_loss(samples)`，推理用 `model.eval().sample_actions(...)` 返回最终动作。物理 query offsets 的单位为秒，flow time 是独立的 `[0,1]` 生成进度。
+当前为单进程研究基线。默认 CPU 调试，GPU 单卡改 `train.device=cuda`。尚不提供分布式训练、在线缓存或机器人执行器，也没有真实任务效果结论。实现细节见 [docs/design.md](docs/design.md)，验证见 [docs/validation.md](docs/validation.md)。
 
-更多语义、维度、可见性和实现选择见 [docs/design.md](docs/design.md)，验证记录见 [docs/validation.md](docs/validation.md)。
+开发期直接替换废弃实现，同步删除旧代码、配置、文档和失效实验产物，不维护兼容路径。

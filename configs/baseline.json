@@ -3,7 +3,8 @@
   "output": "../runs/baseline",
   "model": {
     "d_model": 128, "heads": 4, "layers": 4, "mlp_ratio": 4,
-    "patch_size": 16, "max_tokens": 4096, "randomize_ids": true, "flow_steps": 10
+    "patch_size": 16, "max_tokens": 4096, "randomize_ids": true,
+    "chunk_size": 8, "action_interval_ns": 50000000
   },
   "sampling": {
     "image_size": [64, 64], "max_image_frames": 4,

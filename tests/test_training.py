@@ -8,7 +8,7 @@ from loom_policy.train import train, load_checkpoint
 
 def config(manifest, output):
     return {"manifest": str(manifest), "output": str(output),
-            "model": {"d_model": 16, "heads": 2, "layers": 1, "patch_size": 8, "dropout": .1},
+            "model": {"d_model": 16, "heads": 2, "layers": 1, "patch_size": 8, "dropout": .1, "chunk_size": 3},
             "sampling": {"image_size": [16, 16], "max_image_frames": 2, "max_state_events": 4},
             "train": {"device": "cpu", "steps": 6, "batch_size": 1, "save_every": 2,
                       "lr": .001, "seed": 11, "cpu_threads": 2}}
@@ -22,13 +22,13 @@ def test_checkpoint_resume_exact_optimizer_data_rng_and_prediction(manifest, tmp
     checkpoint = train(resumed_config, resume=partial)
     a, b = load_checkpoint(full), load_checkpoint(checkpoint)
     assert a["step"] == b["step"] == 6
-    assert b["format_version"] == 2
+    assert b["format_version"] == 3
     assert a["epoch"] == b["epoch"] and a["cursor"] == b["cursor"]
     for key in a["model"]:
         torch.testing.assert_close(a["model"][key], b["model"][key], atol=0, rtol=0)
-    result = predict(checkpoint, manifest, steps=3, seed=27)
-    assert result["flow_steps"] == 3 and result["seed"] == 27
-    assert result == predict(checkpoint, manifest, steps=3, seed=27)
+    result = predict(checkpoint, manifest)
+    assert result["offsets_ns"] == (50_000_000, 100_000_000, 150_000_000)
+    assert result == predict(checkpoint, manifest)
     assert np.asarray(result["relative_actions"]).shape == (3, 20)
     from loom_policy.geometry import pose_to_matrix
     assert pose_to_matrix(result["absolute_targets"]["left_eef"]).shape == (3, 4, 4)

@@ -1,14 +1,9 @@
-"""Shallow content maps + shared metadata MLP + one Transformer.
-
-Observation events are filtered before *any* mixing layer. Action queries
-contain the flow state x_t and flow time, never future observation events.
-"""
+"""Observation tokens -> shared Transformer -> direct action-chunk regression."""
 from dataclasses import dataclass
 import math
 import torch
 from torch import nn
-from .events import PolicyInput
-from .flow import FlowMatchingHead, conditional_path, masked_velocity_loss
+from .events import PolicyInput, ChunkConfig
 
 
 @dataclass(frozen=True)
@@ -23,20 +18,24 @@ class ModelConfig:
     max_streams: int = 32
     max_tokens: int = 4096
     randomize_ids: bool = True
-    flow_steps: int = 10
+    chunk_size: int = 8
+    action_interval_ns: int = 50_000_000
 
     def __post_init__(self):
-        if any(x < 1 for x in (self.d_model, self.heads, self.layers, self.mlp_ratio,
-                               self.patch_size, self.max_segments, self.max_streams, self.max_tokens)):
-            raise ValueError("Model sizes and token budget must be positive")
+        if any(type(x) is not int or x < 1 for x in (
+                self.d_model, self.heads, self.layers, self.mlp_ratio, self.patch_size,
+                self.max_segments, self.max_streams, self.max_tokens)):
+            raise ValueError("Model sizes and token budget must be positive integers")
         if self.d_model % self.heads or not 0 <= self.dropout < 1:
             raise ValueError("d_model must be divisible by heads; dropout must be in [0,1)")
-        if type(self.flow_steps) is not int or self.flow_steps < 1:
-            raise ValueError("flow_steps must be a positive integer")
+        self.chunk  # validate the fixed output timing
+
+    @property
+    def chunk(self):
+        return ChunkConfig(self.chunk_size, self.action_interval_ns)
 
 
 def text_positions(length, width, device, dtype):
-    """Byte order, independent of event ordering and physical event time."""
     position = torch.arange(length, device=device, dtype=dtype)[:, None]
     frequency = torch.exp(torch.arange(0, width, 2, device=device, dtype=dtype) * (-math.log(10000) / width))
     out = torch.zeros(length, width, device=device, dtype=dtype)
@@ -55,18 +54,16 @@ class LoomPolicy(nn.Module):
         d = c.d_model
         self.patch = nn.Conv2d(3, d, kernel_size=c.patch_size, stride=c.patch_size)
         self.state = nn.Sequential(nn.Linear(self.state_dim, d), nn.GELU(), nn.Linear(d, d))
-        # Download-free, shallow UTF-8 byte baseline; replaceable by a future
-        # text input map without changing event/segment/query semantics.
         self.text = nn.Embedding(256, d)
         self.segment = nn.Embedding(c.max_segments, d)
         self.stream = nn.Embedding(c.max_streams, d)
-        self.modality = nn.Embedding(4, d)  # image, state, text, action query
+        self.modality = nn.Embedding(3, d)  # image, state, text only
         self.meta = nn.Sequential(nn.Linear(4 + 3 * d, d), nn.GELU(), nn.Linear(d, d))
-        self.flow_head = FlowMatchingHead(d, self.action_dim)
         layer = nn.TransformerEncoderLayer(d, c.heads, c.mlp_ratio * d, c.dropout,
                                           batch_first=True, norm_first=True, activation="gelu")
         self.backbone = nn.TransformerEncoder(layer, c.layers, nn.LayerNorm(d), enable_nested_tensor=False)
-        # TransformerEncoder otherwise clones identical initial layer weights.
+        self.action_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(),
+                                         nn.Linear(d, c.chunk_size * self.action_dim))
         for module in self.backbone.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -81,13 +78,9 @@ class LoomPolicy(nn.Module):
                                    self.stream.weight[stream].expand(n, -1),
                                    self.modality.weight[modality].expand(n, -1)), dim=-1))
 
-    def tokenize(self, inputs: PolicyInput, noisy_actions, flow_time):
+    def tokenize(self, inputs: PolicyInput):
         c = self.config
-        device, dtype = self.flow_head.query_bias.device, self.flow_head.query_bias.dtype
-        noisy_actions = torch.as_tensor(noisy_actions, device=device, dtype=dtype)
-        if noisy_actions.shape != (len(inputs.query.offsets), self.action_dim):
-            raise ValueError("Noisy action horizon must match query offsets")
-        query_content = self.flow_head.condition(noisy_actions, flow_time)
+        device, dtype = self.patch.weight.device, self.patch.weight.dtype
         segments = inputs.visible()
         if len(segments) > c.max_segments:
             raise ValueError("Too many segments; increase max_segments")
@@ -110,20 +103,19 @@ class LoomPolicy(nn.Module):
                 continuous[:, 3] = 1
             pieces.append(content + self.metadata(continuous, sid, rid, modality))
 
-        target_sid = None
+        current_span = None
         for index, seg in enumerate(segments):
             sid = seg_ids[index]
-            target = seg.segment_id == inputs.query.segment_id
-            # Target anchor=query time: preserves observation-to-query latency.
-            # Reference anchor=last visible event: independent local clocks.
-            anchor = inputs.query.time if target else max((e.time for e in seg.events), default=0)
+            current = seg.segment_id == inputs.current.segment_id
+            anchor = inputs.time if current else max((e.time for e in seg.events), default=0)
             streams = sorted({e.stream_id for e in seg.events})
-            if len(streams) + 1 > c.max_streams:
-                raise ValueError("Too many streams; reserve one stream for the action query")
-            stream_ids = torch.arange(len(streams) + 1, device=device)
+            if len(streams) > c.max_streams:
+                raise ValueError("Too many streams; increase max_streams")
+            stream_ids = torch.arange(len(streams), device=device)
             if self.training and c.randomize_ids:
-                stream_ids = torch.randperm(c.max_streams, device=device)[:len(streams) + 1]
+                stream_ids = torch.randperm(c.max_streams, device=device)[:len(streams)]
             mapping = dict(zip(streams, stream_ids))
+            start = count
             for event in seg.events:
                 tau = event.time - anchor
                 rid = mapping[event.stream_id]
@@ -150,72 +142,43 @@ class LoomPolicy(nn.Module):
                     ids = torch.tensor(list(event.value.encode("utf-8")), device=device, dtype=torch.long)
                     content = self.text(ids) + text_positions(len(ids), c.d_model, device, dtype)
                     append(content, tau, None, sid, rid, 2)
-            if target:
-                target_sid = sid
-                query_stream = stream_ids[-1]
-        start = count
-        for h, offset in enumerate(inputs.query.offsets):
-            append(query_content[h:h + 1], offset, None, target_sid, query_stream, 3)
-        return torch.cat(pieces), slice(start, count)
+            if current:
+                current_span = slice(start, count)
+        return torch.cat(pieces), current_span
 
-    def forward(self, inputs: list[PolicyInput], noisy_actions, flow_times):
-        """Predict velocity, not clean actions, at the supplied flow state."""
+    def forward(self, inputs: list[PolicyInput]):
+        """One forward pass -> [batch, chunk_size,20] continuous actions."""
         if not inputs:
             raise ValueError("Empty batch")
-        if len(noisy_actions) != len(inputs) or len(flow_times) != len(inputs):
-            raise ValueError("One noisy chunk and flow time are required per sample")
-        tokenized = [self.tokenize(sample, noisy, time)
-                     for sample, noisy, time in zip(inputs, noisy_actions, flow_times, strict=True)]
+        tokenized = [self.tokenize(sample) for sample in inputs]
         longest = max(len(tokens) for tokens, _ in tokenized)
-        tokens = self.flow_head.query_bias.new_zeros(len(inputs), longest, self.config.d_model)
+        tokens = self.patch.weight.new_zeros(len(inputs), longest, self.config.d_model)
         padding = torch.ones((len(inputs), longest), device=tokens.device, dtype=torch.bool)
         for i, (value, _) in enumerate(tokenized):
             tokens[i, :len(value)] = value
             padding[i, :len(value)] = False
         hidden = self.backbone(tokens, src_key_padding_mask=padding)
-        return [self.flow_head.velocity(hidden[i, span]) for i, (_, span) in enumerate(tokenized)]
+        # Pool real current-trajectory observations AFTER shared multimodal
+        # attention. References condition them through the same backbone.
+        pooled = torch.stack([hidden[i, span].mean(dim=0) for i, (_, span) in enumerate(tokenized)])
+        return self.action_head(pooled).reshape(len(inputs), self.config.chunk_size, self.action_dim)
 
-    def flow_matching_loss(self, samples, generator=None):
-        """One uniformly sampled flow time per complete action chunk."""
-        if not samples:
-            raise ValueError("Empty batch")
-        parameter = self.flow_head.query_bias
-        noisy, velocities, masks, times = [], [], [], []
-        for sample in samples:
-            target = sample["target"].to(parameter)
-            mask = sample["mask"].to(device=parameter.device, dtype=torch.bool)
-            noise = torch.randn(target.shape, device=parameter.device, dtype=parameter.dtype, generator=generator)
-            time = torch.rand((), device=parameter.device, dtype=parameter.dtype, generator=generator)
-            state, velocity = conditional_path(target, mask, noise, time)
-            noisy.append(state)
-            velocities.append(velocity)
-            masks.append(mask)
-            times.append(time)
-        predictions = self([sample["input"] for sample in samples], noisy, times)
-        return masked_velocity_loss(predictions, velocities, masks)
 
-    @torch.no_grad()
-    def sample_actions(self, inputs, *, steps=None, generator=None, initial_noise=None):
-        """Euler-integrate dx/dt=v_theta(obs,x,t) from Gaussian t=0 to t=1."""
-        if self.training:
-            raise ValueError("Call model.eval() before flow sampling")
-        steps = self.config.flow_steps if steps is None else steps
-        if type(steps) is not int or steps < 1:
-            raise ValueError("Flow sampling steps must be a positive integer")
-        if not inputs or (initial_noise is not None and len(initial_noise) != len(inputs)):
-            raise ValueError("Sampling needs inputs and one initial noise chunk per sample")
-        parameter = self.flow_head.query_bias
-        state = []
-        for i, sample in enumerate(inputs):
-            shape = (len(sample.query.offsets), self.action_dim)
-            noise = (torch.randn(shape, device=parameter.device, dtype=parameter.dtype, generator=generator)
-                     if initial_noise is None else torch.as_tensor(initial_noise[i], device=parameter.device, dtype=parameter.dtype).clone())
-            if noise.shape != shape or not torch.isfinite(noise).all():
-                raise ValueError("Initial noise must be finite and match [H,20]")
-            state.append(noise)
-        for i in range(steps):
-            velocity = self(inputs, state, [i / steps] * len(inputs))
-            state = [x + v / steps for x, v in zip(state, velocity, strict=True)]
-        if any(not torch.isfinite(x).all() for x in state):
-            raise FloatingPointError("Nonfinite flow sample")
-        return state
+def masked_l1_loss(predictions, samples):
+    """OFT-style continuous L1 objective; missing fields have no gradients."""
+    if len(predictions) != len(samples) or not samples:
+        raise ValueError("A nonempty aligned batch is required")
+    total = predictions.new_zeros(())
+    count = 0
+    for pred, sample in zip(predictions, samples, strict=True):
+        target = sample["target"].to(pred)
+        mask = sample["mask"].to(device=pred.device, dtype=torch.bool)
+        if target.shape != pred.shape or mask.shape != pred.shape:
+            raise ValueError("Target/mask must match the configured [chunk_size,20]")
+        if not torch.isfinite(target[mask]).all():
+            raise ValueError("Nonfinite supervised target")
+        total = total + (pred[mask] - target[mask]).abs().sum()
+        count += int(mask.sum())
+    if count == 0:
+        raise ValueError("No supervised action fields")
+    return total / count

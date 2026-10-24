@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
-from .events import Event, Segment, Query, PolicyInput
+from .events import Event, Segment, ChunkConfig, PolicyInput
 from .geometry import pose_to_matrix, matrix_to_pose, relative, transform_to_action
 
 STREAMS = ("left_eef", "right_eef", "left_gripper", "right_gripper")
@@ -139,7 +139,7 @@ class Episode:
     def anchors(self, time_ns, max_age_ns):
         result = {name: self.at(name, time_ns, max_age_ns) for name in STREAMS}
         if any(value is None for value in result.values()):
-            raise ValueError("Query has missing/stale state anchor")
+            raise ValueError("Current time has missing/stale state anchor")
         return {"left": result["left_eef"], "right": result["right_eef"]}
 
     def state_events(self, end_ns, max_age_ns):
@@ -173,12 +173,12 @@ class Episode:
         timeline, result = self._state_cache[max_age_ns]
         return result[:int(np.searchsorted(timeline, end_ns, side="right"))]
 
-    def labels(self, query_ns, offsets_ns, max_age_ns):
-        anchors = self.anchors(query_ns, max_age_ns)
+    def labels(self, time_ns, offsets_ns, max_age_ns):
+        anchors = self.anchors(time_ns, max_age_ns)
         target = np.zeros((len(offsets_ns), 20), dtype=np.float32)
         mask = np.zeros_like(target, dtype=bool)
         for h, offset in enumerate(offsets_ns):
-            time = query_ns + offset
+            time = time_ns + offset
             ns(time)
             for side, base in (("left", 0), ("right", 10)):
                 pose = self.at(f"{side}_eef", time, max_age_ns, require_coverage=True)
@@ -251,27 +251,25 @@ def export_dataset(root):
 def load_input(row, sampling):
     root = export_dataset(str(Path(row["dataset"]).resolve()))
     episode = root.episode(row["episode_id"])
-    query_ns = ns(row["query_time_ns"])
-    offsets_ns = tuple(ns(x) for x in row["offsets_ns"])
-    query = Query("target", query_ns * 1e-9, tuple(x * 1e-9 for x in offsets_ns))
-    segments = []
+    time_ns = ns(row["time_ns"])
+    references = []
     for i, ref in enumerate(row.get("references", [])):
         ref_data = export_dataset(str(Path(ref.get("dataset", row["dataset"])).resolve()))
         ref_ep = ref_data.episode(ref["episode_id"])
         end = ns(ref["end_ns"]) if "end_ns" in ref else max(int(t[-1]) for t, _ in list(ref_ep.streams.values()) + list(ref_ep.cameras.values()))
-        segments.append(ref_ep.events(f"reference_{i}", end, sampling))
-    segments.append(episode.events("target", query_ns, sampling))
-    policy_input = PolicyInput(segments, query)
+        references.append(ref_ep.events(f"reference_{i}", end, sampling))
+    policy_input = PolicyInput(episode.events("current", time_ns, sampling), time_ns * 1e-9, references)
     policy_input.visible()  # catches target relabelled as a reference
-    anchors = episode.anchors(query_ns, sampling.max_age_ns)
+    anchors = episode.anchors(time_ns, sampling.max_age_ns)
     return policy_input, episode, anchors
 
 
 class ManifestDataset(Dataset):
-    """One explicit JSONL sample per query; split manifests by source episode."""
-    def __init__(self, manifest, sampling=None):
+    """One JSONL observation cutoff per sample; output timing is fixed by model config."""
+    def __init__(self, manifest, sampling=None, chunk=None):
         self.path = Path(manifest).resolve()
         self.sampling = sampling or SamplingConfig()
+        self.chunk = chunk or ChunkConfig()
         self.rows = []
         with self.path.open(encoding="utf-8") as f:
             for line in f:
@@ -291,11 +289,7 @@ class ManifestDataset(Dataset):
     def __getitem__(self, index):
         row = self.rows[index]
         inputs, episode, anchors = load_input(row, self.sampling)
-        target, mask = episode.labels(row["query_time_ns"], row["offsets_ns"], self.sampling.max_age_ns)
+        target, mask = episode.labels(row["time_ns"], self.chunk.offsets_ns, self.sampling.max_age_ns)
         if not mask.any():
             raise ValueError("Sample has no valid future labels")
         return {"input": inputs, "target": torch.from_numpy(target), "mask": torch.from_numpy(mask), "anchors": anchors}
-
-
-def list_collate(samples):
-    return samples  # variable segments / events / horizon: model pads tokens only

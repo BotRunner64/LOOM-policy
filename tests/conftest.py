@@ -65,8 +65,7 @@ def exported(tmp_path):
 @pytest.fixture
 def manifest(exported, tmp_path):
     path = tmp_path / "samples.jsonl"
-    rows = [{"dataset": str(exported), "episode_id": "target", "query_time_ns": time,
-             "offsets_ns": [50_000_000, 100_000_000, 300_000_000],
+    rows = [{"dataset": str(exported), "episode_id": "target", "time_ns": time,
              "references": [{"episode_id": "demo"}]} for time in [120_000_000, 220_000_000]]
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     return path
