@@ -1,4 +1,4 @@
-"""Observation tokens -> shared Transformer -> direct action-chunk regression."""
+"""Observations + action output slots -> shared Transformer -> L1 action chunks."""
 from dataclasses import dataclass
 import math
 import torch
@@ -35,13 +35,32 @@ class ModelConfig:
         return ChunkConfig(self.chunk_size, self.action_interval_ns)
 
 
-def text_positions(length, width, device, dtype):
+def sequence_positions(length, width, device, dtype):
     position = torch.arange(length, device=device, dtype=dtype)[:, None]
     frequency = torch.exp(torch.arange(0, width, 2, device=device, dtype=dtype) * (-math.log(10000) / width))
     out = torch.zeros(length, width, device=device, dtype=dtype)
     out[:, 0::2] = torch.sin(position * frequency)
     out[:, 1::2] = torch.cos(position * frequency[:width // 2])
     return out
+
+
+class ActionHead(nn.Module):
+    """OFT-style per-step MLP over concatenated coordinate-token states."""
+    def __init__(self, width, action_dim):
+        super().__init__()
+        self.input = nn.Sequential(nn.LayerNorm(action_dim * width),
+                                   nn.Linear(action_dim * width, width), nn.ReLU())
+        self.blocks = nn.ModuleList([
+            nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.ReLU())
+            for _ in range(2)])
+        self.output = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, action_dim))
+
+    def forward(self, states):
+        # [B,H,action_dim,D] -> [B,H,action_dim*D]; never pool observations.
+        value = self.input(states.flatten(-2))
+        for block in self.blocks:
+            value = value + block(value)
+        return self.output(value)
 
 
 class LoomPolicy(nn.Module):
@@ -57,13 +76,12 @@ class LoomPolicy(nn.Module):
         self.text = nn.Embedding(256, d)
         self.segment = nn.Embedding(c.max_segments, d)
         self.stream = nn.Embedding(c.max_streams, d)
-        self.modality = nn.Embedding(3, d)  # image, state, text only
+        self.modality = nn.Embedding(4, d)  # image, state, text, action output
         self.meta = nn.Sequential(nn.Linear(4 + 3 * d, d), nn.GELU(), nn.Linear(d, d))
         layer = nn.TransformerEncoderLayer(d, c.heads, c.mlp_ratio * d, c.dropout,
                                           batch_first=True, norm_first=True, activation="gelu")
         self.backbone = nn.TransformerEncoder(layer, c.layers, nn.LayerNorm(d), enable_nested_tensor=False)
-        self.action_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(),
-                                         nn.Linear(d, c.chunk_size * self.action_dim))
+        self.action_head = ActionHead(d, self.action_dim)
         for module in self.backbone.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -103,19 +121,19 @@ class LoomPolicy(nn.Module):
                 continuous[:, 3] = 1
             pieces.append(content + self.metadata(continuous, sid, rid, modality))
 
-        current_span = None
+        action_segment = action_stream = None
         for index, seg in enumerate(segments):
             sid = seg_ids[index]
             current = seg.segment_id == inputs.current.segment_id
             anchor = inputs.time if current else max((e.time for e in seg.events), default=0)
             streams = sorted({e.stream_id for e in seg.events})
-            if len(streams) > c.max_streams:
-                raise ValueError("Too many streams; increase max_streams")
-            stream_ids = torch.arange(len(streams), device=device)
+            count_streams = len(streams) + int(current)
+            if count_streams > c.max_streams:
+                raise ValueError("Too many streams; current segment also needs one action-output stream")
+            stream_ids = torch.arange(count_streams, device=device)
             if self.training and c.randomize_ids:
-                stream_ids = torch.randperm(c.max_streams, device=device)[:len(streams)]
+                stream_ids = torch.randperm(c.max_streams, device=device)[:count_streams]
             mapping = dict(zip(streams, stream_ids))
-            start = count
             for event in seg.events:
                 tau = event.time - anchor
                 rid = mapping[event.stream_id]
@@ -140,11 +158,16 @@ class LoomPolicy(nn.Module):
                     if not isinstance(event.value, str) or not event.value:
                         raise ValueError("text must be nonempty UTF-8 text")
                     ids = torch.tensor(list(event.value.encode("utf-8")), device=device, dtype=torch.long)
-                    content = self.text(ids) + text_positions(len(ids), c.d_model, device, dtype)
+                    content = self.text(ids) + sequence_positions(len(ids), c.d_model, device, dtype)
                     append(content, tau, None, sid, rid, 2)
             if current:
-                current_span = slice(start, count)
-        return torch.cat(pieces), current_span
+                action_segment, action_stream = sid, stream_ids[-1]
+        start = count
+        # Empty content, distinguished by fixed slot position. Our backbone
+        # has no built-in positional encoding, so supply it explicitly.
+        slots = sequence_positions(c.chunk_size * self.action_dim, c.d_model, device, dtype)
+        append(slots, 0., None, action_segment, action_stream, 3)
+        return torch.cat(pieces), slice(start, count)
 
     def forward(self, inputs: list[PolicyInput]):
         """One forward pass -> [batch, chunk_size,20] continuous actions."""
@@ -158,10 +181,9 @@ class LoomPolicy(nn.Module):
             tokens[i, :len(value)] = value
             padding[i, :len(value)] = False
         hidden = self.backbone(tokens, src_key_padding_mask=padding)
-        # Pool real current-trajectory observations AFTER shared multimodal
-        # attention. References condition them through the same backbone.
-        pooled = torch.stack([hidden[i, span].mean(dim=0) for i, (_, span) in enumerate(tokenized)])
-        return self.action_head(pooled).reshape(len(inputs), self.config.chunk_size, self.action_dim)
+        states = torch.stack([hidden[i, span] for i, (_, span) in enumerate(tokenized)])
+        states = states.reshape(len(inputs), self.config.chunk_size, self.action_dim, self.config.d_model)
+        return self.action_head(states)
 
 
 def masked_l1_loss(predictions, samples):

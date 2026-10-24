@@ -44,35 +44,68 @@ def test_padding_batch_singleton_and_all_modalities_receive_gradients():
     torch.testing.assert_close(batch[1:], m([b]), atol=1e-6, rtol=1e-5)
     batch[0].square().sum().backward()
     for parameter in (m.patch.weight, m.state[0].weight, m.text.weight, m.meta[0].weight,
-                      m.action_head[1].weight, m.action_head[-1].weight):
+                      m.action_head.input[1].weight, m.action_head.blocks[0][1].weight,
+                      m.action_head.output[-1].weight):
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0
 
 
-def test_only_observation_tokens_independent_of_output_chunk_size():
+def test_fixed_coordinate_slots_have_distinct_positions_and_count_toward_budget():
     for size in (1, 8):
         m = model(chunk_size=size).eval()
         tokens, span = m.tokenize(sample())
-        # Two 2x2-patch images, one state, five UTF-8 bytes; nothing appended.
-        assert len(tokens) == 4 + 4 + 1 + len("ab方".encode("utf-8"))
-        assert span == slice(4, len(tokens))
+        observations = 4 + 4 + 1 + len("ab方".encode("utf-8"))
+        assert len(tokens) == observations + size * 20
+        assert span == slice(observations, len(tokens))
+        assert len(torch.unique(tokens[span], dim=0)) == size * 20
         assert m([sample()]).shape == (1, size, 20)
+    with pytest.raises(ValueError, match="max_tokens"):
+        model(chunk_size=1, max_tokens=33)([sample()])
+    with pytest.raises(ValueError, match="action-output stream"):
+        model(max_streams=3)([sample()])
 
 
-def test_pool_current_segment_after_attention_references_condition_prediction():
+def test_action_slots_attend_to_reference_and_current_observations():
     m = model().eval()
     a = sample()
     b = copy.deepcopy(a)
     b.references[0].events[0] = replace(b.references[0].events[0], value=torch.ones(3, 16, 16) * .9)
     assert not torch.allclose(m([a]), m([b]))
+    changed_current = copy.deepcopy(a)
+    changed_current.current.events[1] = replace(a.current.events[1], value=np.zeros(26, dtype=np.float32))
+    assert not torch.allclose(m([a]), m([changed_current]))
 
     class IdentityEncoder(nn.Module):
         def forward(self, tokens, src_key_padding_mask):
             return tokens
 
     m.backbone = IdentityEncoder()
-    # With mixing removed, changing reference content must not affect the
-    # readout: it pools current-trajectory tokens, not reference tokens.
+    # Without attention, blank output slots cannot receive observation content.
     torch.testing.assert_close(m([a]), m([b]), atol=0, rtol=0)
+    torch.testing.assert_close(m([a]), m([changed_current]), atol=0, rtol=0)
+    # Even before mixing, the output steps are distinguishable by position.
+    assert not torch.allclose(m([a])[:, 0], m([a])[:, 1])
+
+
+def test_readout_groups_each_steps_coordinate_states_and_excludes_padding():
+    m = model(chunk_size=3).eval()
+    a = sample()
+    b = replace(a, references=[])
+    captured = []
+
+    class IndexedEncoder(nn.Module):
+        def forward(self, tokens, src_key_padding_mask):
+            indexed = torch.arange(tokens.shape[1], dtype=tokens.dtype)[None, :, None].expand_as(tokens)
+            return indexed.masked_fill(src_key_padding_mask[..., None], -999)
+
+    m.backbone = IndexedEncoder()
+    hook = m.action_head.register_forward_pre_hook(lambda module, args: captured.append(args[0]))
+    m([a, b])
+    hook.remove()
+    assert captured[0].shape == (2, 3, 20, 16)
+    # Different observation lengths; all 60 output states keep their order.
+    for i, observation_count in enumerate((14, 10)):
+        expected = torch.arange(observation_count, observation_count + 60).reshape(3, 20)
+        torch.testing.assert_close(captured[0][i, :, :, 0], expected.float())
 
 
 def test_relative_physical_time_and_text_order():

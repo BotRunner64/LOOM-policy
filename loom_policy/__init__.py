@@ -1,4 +1,4 @@
-"""LOOM's observation-only, direct action-chunk policy."""
+"""LOOM's parallel action-token regression policy."""
 from .events import Event, Segment, ChunkConfig, PolicyInput
 from .model import LoomPolicy, ModelConfig
 

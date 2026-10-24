@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loom-policy"
-version = "0.3.0"
-description = "Observation-only robot policy with direct L1 action-chunk regression"
+version = "0.4.0"
+description = "Parallel action-token robot policy with L1 action-chunk regression"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.2", "numpy>=1.24", "pyarrow>=15", "av>=12", "pillow>=10"]
 

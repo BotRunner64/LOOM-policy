@@ -1,18 +1,20 @@
 # LOOM-policy
 
-只输入图像、state、文本观测，经共享 Transformer 后，直接回归当前时刻往后的固定长度双臂 action chunk。参考和当前轨迹共用输入映射与主干。
+图像、state、文本观测与固定 action 输出 token 一起经过共享 Transformer，动作 token 的 hidden states 经共享 MLP 直接回归当前时刻往后的双臂 action chunk。参考和当前轨迹共用输入映射与主干。
 
 ```text
 参考观测 + 当前轨迹截至 t 的观测
         ↓ 浅层映射 + 共享元数据 MLP
-统一观测 token 序列 → 共享 Transformer（一次前向）
-        ↓ 当前轨迹 token 的 hidden states 平均池化
-小 MLP → [H,20] chunk-wise relative 动作
+观测 token + H×20 个 action 输出槽
+        ↓ 共享 Transformer（一次前向，全注意力）
+取 action hidden states → [H,20,D]
+        ↓ 每步拼接20个状态，共享残差 MLP
+[H,20] chunk-wise relative 动作
         ↓ SO(3) 投影 + 双臂当前位姿锚点
 双臂绝对目标位姿 + 夹爪开合
 ```
 
-采用类似 [OpenVLA-OFT](https://github.com/moojink/openvla-oft) 的并行连续动作块与 L1 目标。OFT 自身仍使用动作输出 token；本实现按用户要求进一步简化为观测表示直接读出整个动作块，不是 OFT 的逐项复现。没有动作 token、带噪动作、采样循环或可变未来时间查询。
+采用类似 [OpenVLA-OFT 官方动作头](https://github.com/moojink/openvla-oft/blob/main/prismatic/models/action_heads.py) 的并行 action token 读出与 L1 回归：每步每维一个固定输出槽，默认8步、20维共160个。槽内不输入真实动作，只由固定位置编码区分；同一步20个 hidden states 拼接后由共享 MLP 输出20维动作。没有观测池化、带噪动作、采样循环或可变未来时间查询。
 
 ## 安装
 
@@ -55,7 +57,7 @@ manifest 每行只有数据来源、当前截止时刻和参考，不携带输�
 {"dataset":"/path/to/export","episode_id":"episode_0002","time_ns":1000000000,"references":[{"episode_id":"episode_0001"}]}
 ```
 
-参考可指定不同 `dataset` 和可选 `end_ns`。配置和 manifest 的相对路径分别相对各自文件所在目录解析。可在配置加 `validation_manifest`，所有训练/验证物理源（含参考）必须隔离。checkpoint v3 原子保存模型、优化器、数据游标、epoch 与 RNG；`--steps` 为包含恢复步数的总训练步数。训练及验证指标均为有效动作字段的 L1。
+参考可指定不同 `dataset` 和可选 `end_ns`。配置和 manifest 的相对路径分别相对各自文件所在目录解析。可在配置加 `validation_manifest`，所有训练/验证物理源（含参考）必须隔离。checkpoint v4 原子保存模型、优化器、数据游标、epoch 与 RNG；`--steps` 为包含恢复步数的总训练步数。训练及验证指标均为有效动作字段的 L1。
 
 ## 模型接口
 
@@ -75,7 +77,7 @@ with torch.no_grad():
     actions = model([inputs])  # [batch=1, chunk_size=8, action_dim=20]
 ```
 
-缺失模态不产生 token。`current` 和 `time` 是当前预测的观测边界，不会生成额外 token。参数未经训练时，上例只展示接口。推理只需一次前向，输出确定；没有噪声、采样步数或随机 seed 参数。
+缺失模态不产生 token。`current` 和 `time` 定义观测边界；模型在观测后追加固定数量的 action 输出槽，不携带未来实测值。参数未经训练时，上例只展示接口。推理只需一次前向，输出确定；没有噪声、采样步数或随机 seed 参数。
 
 当前为单进程研究基线。默认 CPU 调试，GPU 单卡改 `train.device=cuda`。尚不提供分布式训练、在线缓存或机器人执行器，也没有真实任务效果结论。实现细节见 [docs/design.md](docs/design.md)，验证见 [docs/validation.md](docs/validation.md)。
 
