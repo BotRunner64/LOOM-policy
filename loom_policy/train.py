@@ -8,13 +8,13 @@ from pathlib import Path
 import random
 import torch
 from .data import ManifestDataset, SamplingConfig
-from .model import LoomPolicy, ModelConfig
+from .model import LoomPolicy, ModelConfig, masked_l1_loss
 
 
 def load_checkpoint(path, device="cpu"):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if checkpoint.get("format_version") != 2:
-        raise ValueError("Expected a LOOM flow-matching checkpoint (format_version=2)")
+    if checkpoint.get("format_version") != 5:
+        raise ValueError("Expected a LOOM per-step action-token checkpoint (format_version=5)")
     return checkpoint
 
 
@@ -46,8 +46,8 @@ def train(config, resume=None, steps_override=None):
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA requested but unavailable")
     torch.set_num_threads(settings.get("cpu_threads", 2))
-    data = ManifestDataset(config["manifest"], sampling)
-    validation = ManifestDataset(config["validation_manifest"], sampling) if config.get("validation_manifest") else None
+    data = ManifestDataset(config["manifest"], sampling, model_config.chunk)
+    validation = ManifestDataset(config["validation_manifest"], sampling, model_config.chunk) if config.get("validation_manifest") else None
     if validation and manifest_sources(data) & manifest_sources(validation):
         raise ValueError("Train/validation source episodes overlap, including reference episodes")
     manifest_hash = hashlib.sha256(Path(config["manifest"]).read_bytes()).hexdigest()
@@ -85,13 +85,13 @@ def train(config, resume=None, steps_override=None):
 
     def checkpoint():
         save_checkpoint(output / "last.pt", {
-            "format_version": 2, "step": step, "epoch": epoch, "cursor": cursor,
+            "format_version": 5, "step": step, "epoch": epoch, "cursor": cursor,
             "model_config": asdict(model_config), "sampling_config": asdict(sampling),
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "train_settings": settings, "manifest_sha256": manifest_hash,
             "torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
             "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
-            "semantics": "conditional-flow-matching/state26-step-body/action20-chunk-body-rot6d",
+            "semantics": "step-token-l1/state26-step-body/action20-chunk-body-rot6d",
         })
 
     try:
@@ -105,7 +105,7 @@ def train(config, resume=None, steps_override=None):
             batch = [data[i] for i in indices]
             model.train()
             optimizer.zero_grad(set_to_none=True)
-            loss = model.flow_matching_loss(batch)
+            loss = masked_l1_loss(model([sample["input"] for sample in batch]), batch)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite loss")
             loss.backward()
@@ -118,12 +118,13 @@ def train(config, resume=None, steps_override=None):
                 model.eval()
                 with torch.no_grad():
                     # Evaluate the complete supplied validation manifest.
-                    losses = []
-                    generator = torch.Generator(device=device).manual_seed(settings.get("validation_seed", 0))
+                    total_error, valid_fields = 0., 0
                     for i in range(len(validation)):
                         sample = validation[i]
-                        losses.append(float(model.flow_matching_loss([sample], generator=generator)))
-                record["validation_loss"] = sum(losses) / len(losses)
+                        count = int(sample["mask"].sum())
+                        total_error += float(masked_l1_loss(model([sample["input"]]), [sample])) * count
+                        valid_fields += count
+                record["validation_loss"] = total_error / valid_fields
             with (output / "metrics.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
             print(json.dumps(record), flush=True)

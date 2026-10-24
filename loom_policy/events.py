@@ -1,5 +1,5 @@
 """Public inference interface. Times are seconds, never frame indices."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 import math
 
@@ -26,42 +26,48 @@ class Segment:
 
 
 @dataclass(frozen=True)
-class Query:
-    segment_id: str
-    time: float
-    offsets: tuple[float, ...]
+class ChunkConfig:
+    """Fixed output timing, shared by the model and label construction."""
+    size: int = 8
+    interval_ns: int = 50_000_000
 
     def __post_init__(self):
-        if not math.isfinite(self.time) or not self.offsets:
-            raise ValueError("Query needs a finite time and at least one offset")
-        if any(not math.isfinite(x) or x <= 0 for x in self.offsets):
-            raise ValueError("Offsets must be finite positive seconds")
-        if any(a >= b for a, b in zip(self.offsets, self.offsets[1:])):
-            raise ValueError("Offsets must be strictly increasing")
+        if type(self.size) is not int or self.size < 1 or type(self.interval_ns) is not int or self.interval_ns < 1:
+            raise ValueError("Chunk size and interval_ns must be positive integers")
+        if self.size * self.interval_ns > 2**63 - 1:
+            raise ValueError("Chunk duration exceeds int64 nanoseconds")
+
+    @property
+    def offsets_ns(self):
+        return tuple(self.interval_ns * (h + 1) for h in range(self.size))
 
 
 @dataclass(frozen=True)
 class PolicyInput:
-    segments: list[Segment]
-    query: Query
+    current: Segment
+    time: float
+    references: list[Segment] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not math.isfinite(self.time):
+            raise ValueError("Current time must be finite seconds")
 
     def visible(self) -> list[Segment]:
-        ids = [s.segment_id for s in self.segments]
-        sources = [s.source_id for s in self.segments]
+        segments = [*self.references, self.current]
+        ids = [s.segment_id for s in segments]
+        sources = [s.source_id for s in segments]
         if not ids or any(not x for x in ids) or len(set(ids)) != len(ids):
             raise ValueError("segment_id must be nonempty and unique")
         if any(not x for x in sources) or len(set(sources)) != len(sources):
-            raise ValueError("Each physical source must occur once; never relabel target future as reference")
-        if self.query.segment_id not in ids:
-            raise ValueError("Query segment is absent")
+            raise ValueError("Each physical source must occur once; current trajectory cannot also be a reference")
         result = []
-        for seg in self.segments:
-            events = [e for e in seg.events if seg.segment_id != self.query.segment_id
-                      or e.time <= self.query.time]
+        for seg in segments:
+            events = [e for e in seg.events if seg.segment_id != self.current.segment_id
+                      or e.time <= self.time]
             # No temporal/modality embeddings for sequence order: use actual time,
             # explicit text index, and patch positions. Sort only for reproducibility.
             events.sort(key=lambda e: (e.time, e.stream_id, e.modality))
             result.append(Segment(seg.segment_id, seg.source_id, events))
-        if not any(s.events for s in result):
-            raise ValueError("At least one visible event is required")
+        if not result[-1].events:
+            raise ValueError("Current trajectory needs at least one visible observation")
         return result

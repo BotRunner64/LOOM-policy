@@ -6,18 +6,19 @@ import pytest
 from loom_policy.data import ExportDataset, ManifestDataset, SamplingConfig, load_input
 from loom_policy.geometry import matrix_to_pose, relative
 from loom_policy.index import build_manifest
+from loom_policy.events import ChunkConfig
 
 
 def test_async_contract_times_no_fps_and_no_future_input(exported, manifest):
     sample = ManifestDataset(manifest)[1]
     inputs = sample["input"]
-    target = inputs.segments[-1]
-    reference = inputs.segments[0]
+    target = inputs.current
+    reference = inputs.references[0]
     assert all(e.time <= .22 + 1e-12 for e in target.events)
     assert any(e.time > .22 for e in reference.events)
     assert [e.time for e in target.events if e.modality == "image"] == pytest.approx([0, .15])
     assert [e.value for e in target.events if e.modality == "text"] == ["pick 方块"]
-    # Four streams don't share row counts/times. At query .22, left=.20/right=.22.
+    # Four streams don't share row times. At current time .22, left=.20/right=.22.
     ep = ExportDataset(exported).episode("target")
     np.testing.assert_allclose(sample["anchors"]["left"][:3, 3], [.2, 0, 0])
     np.testing.assert_allclose(sample["anchors"]["right"][:3, 3], [1.2, 0, 0])
@@ -71,14 +72,16 @@ def test_invalid_arrow_and_path_escape(exported):
 
 def test_index_and_relative_manifest_paths(exported, tmp_path):
     output = tmp_path / "index.jsonl"
-    count = build_manifest(exported, output, episodes=["target"], stride=1, horizon=2,
-                           dt_ns=50_000_000, references=["demo"])
+    chunk = ChunkConfig(size=2)
+    count = build_manifest(exported, output, episodes=["target"], stride=1, chunk=chunk,
+                           references=["demo"])
     assert count > 1
-    assert len(ManifestDataset(output)) == count
+    assert len(ManifestDataset(output, chunk=chunk)) == count
     row = json.loads(output.read_text().splitlines()[0])
     row["dataset"] = "export"
     output.write_text(json.dumps(row) + "\n")
-    assert ManifestDataset(output)[0]["mask"].any()
+    assert ManifestDataset(output, chunk=chunk)[0]["target"].shape == (2, 20)
+    assert ManifestDataset(output, chunk=chunk)[0]["mask"].any()
 
 
 def test_duplicate_native_timestamp_uses_last_arrival(exported):

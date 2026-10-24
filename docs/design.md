@@ -1,59 +1,62 @@
-# 实现合同与设计选择
+# 当前设计：每步一个 action token，L1 回归动作块
 
-## 依据与优先级
+## 设计依据
 
-1. [Notion LOOM-policy](https://app.notion.com/p/3f90249b500e80999eebe508023adde0)，当前架构附件 `loom-policy-design-v2.html`，讨论稿 v0.2 / 2026-10-22。SHA256：`494a3fa57571a7bb7a914dae7f7274c2a5989ae84a29c4c374fabaad9d530e6b`。
-2. 相邻 `LOOM-data/docs/contract/export-contract.md`，读取时仓库 HEAD：`fc93c1e030afea952af13d8a97602b763113ab87`；契约文件 SHA256：`85cb65829aa30cbbb48b4f22921c336a92570b73c5e7bbe04122dc378f0a91a0`。此文件是导出格式唯一事实源，本仓库只记录消费方式，不修改上游契约。
-3. Notion 的 `relative-pose-v2.html` 解释 body-frame 相对位姿；最终采用架构 v0.2 指定的输入 Step / 输出 Chunk。旧页面中的“手工设计版”已废弃。
+优先级为用户当前决定、数据契约、已有架构草案：用户指定每个未来时间步一个 action 输出 token，直接回归该步20维动作，删除按动作维度展开的 token 和池化/生成式动作头；数据继续遵循 `LOOM-data/docs/contract/export-contract.md`；多模态统一 token 与共享主干沿用 [Notion LOOM-policy](https://app.notion.com/p/3f90249b500e80999eebe508023adde0) 的 v0.2 草案。
 
-## 原生异步数据的消费
+数据契约读取时 SHA256：`85cb65829aa30cbbb48b4f22921c336a92570b73c5e7bbe04122dc378f0a91a0`。上游文件是导出格式唯一事实源，此处只说明消费方式。
 
-严格读取 `timestamp_ns:int64`，原生 pose `fixed_size_list<float64,12>`，gripper `float32`，按流校验排序、非空、非有限值、SO(3)、范围和文件存在性。额外字段忽略。位姿排列是 `[x,y,z,R00,R10,R20,R01,R11,R21,R02,R12,R22]`，不是行优先，不把旋转当 Euler 或 quaternion。
+借鉴 [OpenVLA-OFT 论文](https://arxiv.org/abs/2502.19645) 的连续动作、并行 chunk 和 L1 目标。其[官方动作头](https://github.com/moojink/openvla-oft/blob/main/prismatic/models/action_heads.py)对动作输出槽的 hidden states 做 MLP 回归；本实现使用每个时间步一个 token 与共享 MLP，不复制其每维一个 token 再拼接的布局；主干是自己的小型统一 Transformer。
 
-四路 state 的时间戳取并集，在每个实际到达时刻做 **backward-as-of**：每一路只看当时或之前最后一个样本。不插值、不从行号配对、不使用后到的样本。重复时间取流内最后一条。只有四路都已到达且没有超出 `max_age_ns` 时，才产生一个统一 state 事件；初始缺失期间不以零值代替。该合并是下游模型适配器的明确选择，导出文件仍保持原生异步格式。
+## 输入接口
 
-每次产生 state 事件时，左右 EEF 分别计算 `T_prev^-1 @ T_now`，prev 是前一个已产生的完整 state 事件。第一次是 identity；夹爪为当前实际 openness，保留绝对 `[0,1]`。某一路未更新时其 EEF delta 为 identity。先计算完整事件 delta，再按明确的采样预算选择事件，不把删帧后的跨步运动误写为原生一步运动。采样后不保证历史 delta 可直接连乘还原完整轨迹，模型仍有每个事件的真实时间。
+`PolicyInput(current, time, references=[])`。`current` 是当前连续物理轨迹，包含历史和当前实际到达的 image/state/text 事件；`time` 是当前预测时刻（秒）；`references` 是其他物理轨迹的可见观测。
 
-state 共 26 维，顺序为 `[left_delta_pose12,left_gripper,right_delta_pose12,right_gripper]`。只有一个共享 state MLP，没有本体 embedding 或维度 mask。左右臂分别在自己的 body 系编码，不推断两臂绝对外参/间距。
+整理输入时保留当前段 `event.time <= time` 的事件。参考段保留给定可见事件。相同 `source_id` 不能既作为 current 又作为 reference；当前段必须至少有一个可见观测。来源真实性由调用方保证，标准适配器用 resolved episode 路径作为身份。
 
-每个相机独立解码 MP4 的显示顺序，按 Parquet 的 `frame_index` 索引，实际时间只用 `timestamp_ns`。不使用 FPS/PTS 推算时刻。视频必须无音轨，帧数与索引一致。图像在数据层按配置 resize 到固定尺寸、RGB 归一化到 `[0,1]`，模型直接做非重叠 patch embedding；不使用视觉塔、CLS 或压缩器。
+调用方不传入待预测动作、预测 offsets 或标签。模型内部追加固定 action 占位 token；变长的是观测，输出 H 与 Δt 固定为策略配置。输出槽用于并行读出，不接受可变未来时间查询。
 
-instruction 在 `start_ns` 到达时成为一个文本事件；目标 query 之后才开始的指令不输入。不把已知指令的 `end_ns` 当作输入特征，不泄漏未来切换时刻。更早已观察的指令仍属于历史。
+## 异步导出数据
 
-## 监督与控制端输出
+读取共同 clock 下 `timestamp_ns:int64`，不按行配对、不用 FPS 推算时间。四路 state 在原生时间并集上 backward-as-of 合并，只使用已经到达的样本，重复时间取最后一条；四路均到达且未超过 `max_age_ns` 才产生统一 state 事件。
 
-LOOM-data 不记录 action。每个 future offset 使用该时刻已到达的最近实测状态作监督，并记录显式 staleness/episode-end mask；不会读取指定时刻之后的样本或超出流末尾延拓。左右 EEF 都相对 **同一 query 时刻各自的观测锚点** 编码为 `T_query^-1 @ T_future`，不在 horizon 内累乘动作。
+每臂输入为相对前一个完整 state 事件的 `T_prev^-1 @ T_now`（pose12），加当前绝对 openness；双臂26维，首次相对位姿为 identity。未更新的 EEF 为 identity motion。先算完整事件 delta，再做显式数量采样；不会把删帧后的长步运动改写为原生一步。两个 EEF 可以使用不同固定世界系，body-frame delta 分别计算，不推断臂间外参。
 
-每臂 10 维：`[translation3,rotation_column0_3,rotation_column1_3,openness1]`，双臂总 20 维，左臂在前。位置单位为米，旋转是前两列的 6D 表示，夹爪是绝对开合程度。动作块作为 flow matching 的数据端点；未来图像/状态不会作为观测事件输入。
+pose12 为位置3和列优先完整旋转9：`[x,y,z,R00,R10,R20,R01,R11,R21,R02,R12,R22]`，按 SO(3) 检查。夹爪范围 `[0,1]`。相机按显示顺序解码，采集时间只读逐帧索引；检查 H.264、无音轨与帧数一致。instruction 从 start_ns 到达时作为文本事件，end_ns 不作模型特征。
 
-推理以 Gram-Schmidt 把预测 6D 旋转映射到 SO(3)，退化向量有确定性正交基兜底，夹爪裁剪到 `[0,1]`；再乘对应 EEF 的 query anchor 还原成导出格式绝对 pose12。此处是数学反变换，不包含机器人限位、控制周期、碰撞处理或实际下发。
+## 统一 token 与共享主干
 
-## Conditional flow matching head
+默认 D=128，四层 pre-LN TransformerEncoder，4 heads、FFN=512，层末 LayerNorm。全注意力，batch padding mask 隔离填充；没有未来观测输入，因此不需要额外的时间因果 attention mask。
 
-动作头由用户确定采用 flow matching。使用 [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747) 的条件速度场训练框架，选择高斯噪声到动作的直线路径：每个样本采样 `z ~ N(0,I)`、一个整块共享的 `t ~ Uniform[0,1)`，构造 `x_t=(1-t)z+t*a`，目标速度 `u=a-z`。这里 `t` 是无量纲生成进度，与真实观测秒数和未来动作 offsets 完全独立。
+| 模态 | 内容映射 | token 数 |
+|---|---|---|
+| RGB | Conv2d(3,D,kernel=16,stride=16) | 每图的 patch 数，64×64 默认16个 |
+| state26 | Linear(26,D) → GELU → Linear(D,D) | 每事件1个 |
+| text | UTF-8 byte embedding + sin/cos 字节序号 | 每字节1个 |
+| action output | 空内容 + sin/cos 固定槽位序号 | H个，默认8个 |
 
-`FlowMatchingHead` 把每个 horizon 的带噪动作 `x_t[h]` 线性映射为 D 维，加上 Fourier flow-time 特征经 MLP 的输出和可学习 query bias。再加物理 query 元数据后，与所有观测 token 进入同一个共享 Transformer，最后将每个 query hidden state 映射为 20 维速度 `v_theta(obs,x_t,t)`。整个 action chunk 可相互注意，学习联合分布。
+所有 token 逐一加同一个 metadata MLP 输出：`[tau,x,y,has_xy,E_segment,E_stream,E_modality]`，默认388→128→128。modality 包含 image/state/text/action output 四类。当前段观测 `tau=event.time-time`，参考段相对其可见末端归零，保留真实秒数和异步间隔。图像 x/y 是 patch 中心归一化坐标，其他模态 has_xy=0。
 
-训练最小化有效字段上的 `MSE(v_theta,u)`。无效字段在构造带噪条件之前即以独立噪声代替，令该字段 `x_t=z`，不作为速度监督；无效字段中的零值或 NaN 不会经注意力污染其他字段。这是局部缺失监督的处理约定，尚需真实数据评估其效果。
+segment/stream 为局部类别 ID，训练时可随机重编号。参考与当前共用权重，不存在独立深视觉塔、CLS 或输入压缩器。action 输出槽绑定当前 segment、使用该段额外保留的 stream ID，tau=0、has_xy=0；槽位编码从0到H−1，与观测数量无关。
 
-推理 `sample_actions` 从新的高斯 action chunk 开始，以 `t=0` 到 `t=1` 做显式 Euler 积分：`x <- x + v_theta(obs,x,t)/N`，默认 N=10，可配置 `flow_steps` 或 CLI `--flow-steps`。积分期间不读取标签或监督 mask；固定 seed 或 initial_noise 可复现采样。采样要求 `eval()`，避免 dropout 和随机 ID 在 ODE 各步变化。最终才做 SO(3) 映射和夹爪裁剪，中间速度场在欧氏 action20 空间中求解。
+## 并行动作读出
 
-## 统一 token 与可见性
+每个未来时间步追加一个 action 输出 token。它只含固定的时间步位置编码和 metadata，不输入真实动作值或噪声。所有观测与输出 token 一起经过共享 Transformer，读取 action hidden states `[B,H,D]`；按各样本的实际起点切片，padding 不进入读出。
 
-- 图像：一层 patch Conv2d 等价于共享 patch 线性映射，附 patch 中心 `(x,y)`，`has_xy=1`。
-- state：共享两层 MLP，一事件一个 token，`has_xy=0`。
-- 文本：UTF-8 字节 embedding，每字节一个 token，加显式 sin/cos 序号以保留字节顺序。无需模型下载，是浅层可替换基线，不声称具备预训练语言理解能力。
-- 所有 token 都加同一个元数据 MLP 输出，输入 `[tau,x,y,has_xy,E_segment,E_stream,E_modality]`。
-- 目标段 `tau = event_time-query.time`；参考段相对最后可见事件归零。单位为秒，不按段长度归一化，没有固定最大秒数。模型不做 KV cache，避免锚点移动引起旧缓存无效。
-- ID 是每样本局部类别标签，stream 仅在段内区分来源。训练默认随机重编号 segment/stream，避免模型依赖固定的“参考=0/目标=1”等标签。类别表容量可配，超出报错，不映射到机器人身份。
-- 每个 future offset 产生一个动作查询 token，使用目标 segment、独立 query stream、action modality 和相对未来秒数；内容为当前带噪动作和 flow time 的映射。
+每个时间步的D维表示经过同一个动作头：`LayerNorm → Linear(D,D) → ReLU`，两个 `LayerNorm → Linear(D,D) → ReLU` 残差块，最后 `LayerNorm → Linear(D,20)`。默认D=128，因此动作头输入128维，直接并行输出 `[B,H,20]`。没有按坐标展开的 token 或跨token拼接，也不池化观测。
 
-数据适配器先裁掉目标未来，模型公开入口也再次在任意混合层之前裁掉 query 之后的目标事件。参考可完整提供，因为它属于另一个物理轨迹。相同 `source_id` 不能以不同 segment 重复出现；但客户端若谎报来源，模型无法自行识别，调用方必须保留真实物理来源。
+固定位置编码区分时间步，避免全注意力下空白输出 token 完全对称。输出物理时间由固定H与Δt决定，不接受可变未来时间查询。全部输出 token 并行读取观测并彼此交互，主干只执行一次；所有 token 均不含目标值，因此输出 token 间全注意力不会泄漏标签。
 
-过滤后所有 token 进入一个标准全注意力 TransformerEncoder；观测和 query 可相互注意，query 之间也可注意。训练中的动作 query 是按条件路径构造的 `x_t`；推理中则是 ODE 当前状态，网络两阶段都接收 `(obs,x_t,t)`。未来监督只用于路径和速度目标，不作为额外观测或干净答案注入。batch 内不同样本有 padding mask，彼此隔离。无 context/current 专用分支，无视觉/时间专用注意力机制。因为观测 hidden states 也会依赖 `x_t,t`，每个 ODE step 都运行主干，不复用跨 step 的观测 KV。
+## 标签、损失与输出时间
 
-## 预算、范围与后续研究
+模型配置固定 `chunk_size=H` 和 `action_interval_ns=Δt`。当前时刻 t 发起预测，标签是 `t+Δt,...,t+HΔt` 的最近已到达实测状态；不给首位置塞入 `t` 的同一份观测，避免 EEF 第一项恒为 identity 的无效目标。因为数据没有控制指令，这是下一控制步的目标轨迹代理监督。
 
-采样器默认每相机 4 帧、32 个 state 事件，均匀选取并保留末端；`null` 可取消对应数量预算。是显式采样策略，不是主干固定时间窗。`max_tokens` 仅作为显存保护上限，超过直接报错，不静默截断文本或参考。模型支持不同 segment 数、不同模态、异步时间和不同 horizon；可靠跨度和跨域能力仍依赖训练数据。
+每臂动作10维：平移3、旋转前两列6、实际夹爪1；双臂20维，左右各相对 t 时各自的观测位姿锚点，整个 chunk 共用。过期或超出该流末端的字段不监督，不越界延拓。loss 只对有效字段计算 L1，训练 batch 和完整验证集都按有效字段数归一化。未观测标签即使含 NaN，也不进入输入或误差计算。
 
-待研究项包括 flow 采样步数、语言输入映射、query/observation 注意力形式、源 ID 增广、采样策略、长序列计算、在线缓存以及大规模分布式训练。当前代码不把尚未验证的假设写成实验结论。
+训练和推理调用相同 `model(inputs)`。推理最后将6D旋转正交化为 SO(3)，夹爪裁剪到 `[0,1]`，乘当前 EEF anchor 还原绝对 pose12。这里只生成数学目标，不包含机器人下发或碰撞/限位处理。
+
+## 配置与范围
+
+默认每相机4帧、最多32个state事件，显式均匀取样并保留末端；数量可取消限制。`max_tokens` 包含观测和H个输出token，是计算预算，超过报错，不静默截断。时间没有固定最大秒数，但可靠跨度取决于训练覆盖。
+
+当前 checkpoint 格式 v5，固定输出时序随模型配置保存。没有多套动作头、兼容实现或生成式采样参数。尚未验证真实数据、GPU、大规模分布式和机器人任务效果。

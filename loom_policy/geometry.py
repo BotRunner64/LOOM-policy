@@ -56,7 +56,7 @@ def decode_actions(actions, anchors):
     """[H,20] -> export-format absolute target poses + clipped openness.
 
     Every horizon shares the same observation anchor (no action accumulation).
-    anchors contains separate left/right 4x4 matrices measured at query time.
+    anchors contains separate left/right 4x4 matrices measured at current time.
     """
     a = np.asarray(actions)
     if a.ndim != 2 or a.shape[1] != 20 or not np.isfinite(a).all():
