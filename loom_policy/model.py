@@ -45,19 +45,19 @@ def sequence_positions(length, width, device, dtype):
 
 
 class ActionHead(nn.Module):
-    """OFT-style per-step MLP over concatenated coordinate-token states."""
+    """Shared MLP: one hidden state per timestep -> the complete action vector."""
     def __init__(self, width, action_dim):
         super().__init__()
-        self.input = nn.Sequential(nn.LayerNorm(action_dim * width),
-                                   nn.Linear(action_dim * width, width), nn.ReLU())
+        self.input = nn.Sequential(nn.LayerNorm(width),
+                                   nn.Linear(width, width), nn.ReLU())
         self.blocks = nn.ModuleList([
             nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.ReLU())
             for _ in range(2)])
         self.output = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, action_dim))
 
     def forward(self, states):
-        # [B,H,action_dim,D] -> [B,H,action_dim*D]; never pool observations.
-        value = self.input(states.flatten(-2))
+        # [B,H,D] -> [B,H,action_dim]; the same head is applied to every step.
+        value = self.input(states)
         for block in self.blocks:
             value = value + block(value)
         return self.output(value)
@@ -165,7 +165,7 @@ class LoomPolicy(nn.Module):
         start = count
         # Empty content, distinguished by fixed slot position. Our backbone
         # has no built-in positional encoding, so supply it explicitly.
-        slots = sequence_positions(c.chunk_size * self.action_dim, c.d_model, device, dtype)
+        slots = sequence_positions(c.chunk_size, c.d_model, device, dtype)
         append(slots, 0., None, action_segment, action_stream, 3)
         return torch.cat(pieces), slice(start, count)
 
@@ -182,7 +182,6 @@ class LoomPolicy(nn.Module):
             padding[i, :len(value)] = False
         hidden = self.backbone(tokens, src_key_padding_mask=padding)
         states = torch.stack([hidden[i, span] for i, (_, span) in enumerate(tokenized)])
-        states = states.reshape(len(inputs), self.config.chunk_size, self.action_dim, self.config.d_model)
         return self.action_head(states)
 
 

@@ -13,8 +13,8 @@ from .model import LoomPolicy, ModelConfig, masked_l1_loss
 
 def load_checkpoint(path, device="cpu"):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if checkpoint.get("format_version") != 4:
-        raise ValueError("Expected a LOOM action-token checkpoint (format_version=4)")
+    if checkpoint.get("format_version") != 5:
+        raise ValueError("Expected a LOOM per-step action-token checkpoint (format_version=5)")
     return checkpoint
 
 
@@ -85,13 +85,13 @@ def train(config, resume=None, steps_override=None):
 
     def checkpoint():
         save_checkpoint(output / "last.pt", {
-            "format_version": 4, "step": step, "epoch": epoch, "cursor": cursor,
+            "format_version": 5, "step": step, "epoch": epoch, "cursor": cursor,
             "model_config": asdict(model_config), "sampling_config": asdict(sampling),
             "model": model.state_dict(), "optimizer": optimizer.state_dict(),
             "train_settings": settings, "manifest_sha256": manifest_hash,
             "torch_rng": torch.get_rng_state(), "python_rng": random.getstate(),
             "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
-            "semantics": "action-token-l1/state26-step-body/action20-chunk-body-rot6d",
+            "semantics": "step-token-l1/state26-step-body/action20-chunk-body-rot6d",
         })
 
     try:

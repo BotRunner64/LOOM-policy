@@ -22,7 +22,7 @@ def test_checkpoint_resume_exact_optimizer_data_rng_and_prediction(manifest, tmp
     checkpoint = train(resumed_config, resume=partial)
     a, b = load_checkpoint(full), load_checkpoint(checkpoint)
     assert a["step"] == b["step"] == 6
-    assert b["format_version"] == 4
+    assert b["format_version"] == 5
     assert a["epoch"] == b["epoch"] and a["cursor"] == b["cursor"]
     for key in a["model"]:
         torch.testing.assert_close(a["model"][key], b["model"][key], atol=0, rtol=0)
