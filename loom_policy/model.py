@@ -1,9 +1,9 @@
 """Observations + action output slots -> shared Transformer -> L1 action chunks."""
 from dataclasses import dataclass
-import math
 import torch
 from torch import nn
 from .events import PolicyInput, ChunkConfig
+from .encoders import ViTEncoder, BertTextEncoder, sequence_positions, reset_transformer
 
 
 @dataclass(frozen=True)
@@ -11,6 +11,9 @@ class ModelConfig:
     d_model: int = 128
     heads: int = 4
     layers: int = 4
+    vision_layers: int = 2
+    text_layers: int = 2
+    max_text_tokens: int = 512
     mlp_ratio: int = 4
     patch_size: int = 16
     dropout: float = 0.0
@@ -23,25 +26,17 @@ class ModelConfig:
 
     def __post_init__(self):
         if any(type(x) is not int or x < 1 for x in (
-                self.d_model, self.heads, self.layers, self.mlp_ratio, self.patch_size,
+                self.d_model, self.heads, self.layers, self.vision_layers, self.text_layers,
+                self.max_text_tokens, self.mlp_ratio, self.patch_size,
                 self.max_segments, self.max_streams, self.max_tokens)):
             raise ValueError("Model sizes and token budget must be positive integers")
-        if self.d_model % self.heads or not 0 <= self.dropout < 1:
-            raise ValueError("d_model must be divisible by heads; dropout must be in [0,1)")
+        if self.d_model < 2 or self.d_model % self.heads or not 0 <= self.dropout < 1:
+            raise ValueError("d_model must be >=2 and divisible by heads; dropout must be in [0,1)")
         self.chunk  # validate the fixed output timing
 
     @property
     def chunk(self):
         return ChunkConfig(self.chunk_size, self.action_interval_ns)
-
-
-def sequence_positions(length, width, device, dtype):
-    position = torch.arange(length, device=device, dtype=dtype)[:, None]
-    frequency = torch.exp(torch.arange(0, width, 2, device=device, dtype=dtype) * (-math.log(10000) / width))
-    out = torch.zeros(length, width, device=device, dtype=dtype)
-    out[:, 0::2] = torch.sin(position * frequency)
-    out[:, 1::2] = torch.cos(position * frequency[:width // 2])
-    return out
 
 
 class ActionHead(nn.Module):
@@ -71,9 +66,9 @@ class LoomPolicy(nn.Module):
         super().__init__()
         self.config = c = config or ModelConfig()
         d = c.d_model
-        self.patch = nn.Conv2d(3, d, kernel_size=c.patch_size, stride=c.patch_size)
+        self.image_encoder = ViTEncoder(d, c.heads, c.vision_layers, c.mlp_ratio, c.patch_size, c.dropout)
+        self.text_encoder = BertTextEncoder(d, c.heads, c.text_layers, c.mlp_ratio, c.max_text_tokens, c.dropout)
         self.state = nn.Sequential(nn.Linear(self.state_dim, d), nn.GELU(), nn.Linear(d, d))
-        self.text = nn.Embedding(256, d)
         self.segment = nn.Embedding(c.max_segments, d)
         self.stream = nn.Embedding(c.max_streams, d)
         self.modality = nn.Embedding(4, d)  # image, state, text, action output
@@ -82,13 +77,7 @@ class LoomPolicy(nn.Module):
                                           batch_first=True, norm_first=True, activation="gelu")
         self.backbone = nn.TransformerEncoder(layer, c.layers, nn.LayerNorm(d), enable_nested_tensor=False)
         self.action_head = ActionHead(d, self.action_dim)
-        for module in self.backbone.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.MultiheadAttention):
-                nn.init.xavier_uniform_(module.in_proj_weight)
+        reset_transformer(self.backbone)
 
     def metadata(self, continuous, segment, stream, modality):
         n = continuous.shape[0]
@@ -98,7 +87,7 @@ class LoomPolicy(nn.Module):
 
     def tokenize(self, inputs: PolicyInput):
         c = self.config
-        device, dtype = self.patch.weight.device, self.patch.weight.dtype
+        device, dtype = self.segment.weight.device, self.segment.weight.dtype
         segments = inputs.visible()
         if len(segments) > c.max_segments:
             raise ValueError("Too many segments; increase max_segments")
@@ -139,26 +128,15 @@ class LoomPolicy(nn.Module):
                 rid = mapping[event.stream_id]
                 if event.modality == "image":
                     value = torch.as_tensor(event.value, device=device, dtype=dtype)
-                    if value.ndim != 3 or value.shape[0] != 3 or not torch.isfinite(value).all() or value.min() < 0 or value.max() > 1:
-                        raise ValueError("image must be finite RGB CHW float in [0,1]")
-                    if value.shape[1] % c.patch_size or value.shape[2] % c.patch_size:
-                        raise ValueError("Image dimensions must be divisible by patch_size")
-                    feature = self.patch(value[None])[0]
-                    height, width = feature.shape[1:]
-                    y, x = torch.meshgrid(torch.arange(height, device=device, dtype=dtype),
-                                          torch.arange(width, device=device, dtype=dtype), indexing="ij")
-                    xy = torch.stack(((x.flatten() + .5) / width, (y.flatten() + .5) / height), dim=-1)
-                    append(feature.flatten(1).T, tau, xy, sid, rid, 0)
+                    content, xy = self.image_encoder(value, token_budget=c.max_tokens - count - c.chunk_size)
+                    append(content, tau, xy, sid, rid, 0)
                 elif event.modality == "state":
                     value = torch.as_tensor(event.value, device=device, dtype=dtype)
                     if value.shape != (self.state_dim,) or not torch.isfinite(value).all():
                         raise ValueError("state must be finite [26]")
                     append(self.state(value[None]), tau, None, sid, rid, 1)
                 else:
-                    if not isinstance(event.value, str) or not event.value:
-                        raise ValueError("text must be nonempty UTF-8 text")
-                    ids = torch.tensor(list(event.value.encode("utf-8")), device=device, dtype=torch.long)
-                    content = self.text(ids) + sequence_positions(len(ids), c.d_model, device, dtype)
+                    content = self.text_encoder(event.value, token_budget=c.max_tokens - count - c.chunk_size)
                     append(content, tau, None, sid, rid, 2)
             if current:
                 action_segment, action_stream = sid, stream_ids[-1]
@@ -175,7 +153,7 @@ class LoomPolicy(nn.Module):
             raise ValueError("Empty batch")
         tokenized = [self.tokenize(sample) for sample in inputs]
         longest = max(len(tokens) for tokens, _ in tokenized)
-        tokens = self.patch.weight.new_zeros(len(inputs), longest, self.config.d_model)
+        tokens = self.segment.weight.new_zeros(len(inputs), longest, self.config.d_model)
         padding = torch.ones((len(inputs), longest), device=tokens.device, dtype=torch.bool)
         for i, (value, _) in enumerate(tokenized):
             tokens[i, :len(value)] = value
