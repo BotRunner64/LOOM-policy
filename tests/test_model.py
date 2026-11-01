@@ -43,7 +43,10 @@ def test_padding_batch_singleton_and_all_modalities_receive_gradients():
     torch.testing.assert_close(batch[:1], m([a]), atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(batch[1:], m([b]), atol=1e-6, rtol=1e-5)
     batch[0].square().sum().backward()
-    for parameter in (m.patch.weight, m.state[0].weight, m.text.weight, m.meta[0].weight,
+    for parameter in (m.image_encoder.patch.weight, m.image_encoder.transformer.layers[0].self_attn.in_proj_weight,
+                      m.text_encoder.embedding.weight, m.text_encoder.position.weight,
+                      m.text_encoder.transformer.layers[0].self_attn.in_proj_weight,
+                      m.state[0].weight, m.meta[0].weight,
                       m.action_head.input[1].weight, m.action_head.blocks[0][1].weight,
                       m.action_head.output[-1].weight):
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0

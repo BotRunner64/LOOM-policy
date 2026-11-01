@@ -3,6 +3,7 @@
   "output": "../runs/baseline",
   "model": {
     "d_model": 128, "heads": 4, "layers": 4, "mlp_ratio": 4,
+    "vision_layers": 2, "text_layers": 2, "max_text_tokens": 512,
     "patch_size": 16, "max_tokens": 4096, "randomize_ids": true,
     "chunk_size": 8, "action_interval_ns": 50000000
   },

@@ -1,8 +1,8 @@
-# 当前设计：每步一个 action token，L1 回归动作块
+# 当前设计：随机初始化 ViT / BERT encoder + 共享 Transformer
 
 ## 设计依据
 
-优先级为用户当前决定、数据契约、已有架构草案：用户指定每个未来时间步一个 action 输出 token，直接回归该步20维动作，删除按动作维度展开的 token 和池化/生成式动作头；数据继续遵循 `LOOM-data/docs/contract/export-contract.md`；多模态统一 token 与共享主干沿用 [Notion LOOM-policy](https://app.notion.com/p/3f90249b500e80999eebe508023adde0) 的 v0.2 草案。
+优先级为用户当前决定、数据契约、已有架构草案：用户指定小型ViT图像encoder、小型BERT式文本encoder，均随机初始化并保留token序列，再进入共享Transformer；每个未来时间步一个action token回归20维动作；数据继续遵循 `LOOM-data/docs/contract/export-contract.md`；多模态统一 token 与共享主干沿用 [Notion LOOM-policy](https://app.notion.com/p/3f90249b500e80999eebe508023adde0) 的 v0.2 草案。
 
 数据契约读取时 SHA256：`85cb65829aa30cbbb48b4f22921c336a92570b73c5e7bbe04122dc378f0a91a0`。上游文件是导出格式唯一事实源，此处只说明消费方式。
 
@@ -24,20 +24,32 @@
 
 pose12 为位置3和列优先完整旋转9：`[x,y,z,R00,R10,R20,R01,R11,R21,R02,R12,R22]`，按 SO(3) 检查。夹爪范围 `[0,1]`。相机按显示顺序解码，采集时间只读逐帧索引；检查 H.264、无音轨与帧数一致。instruction 从 start_ns 到达时作为文本事件，end_ns 不作模型特征。
 
+## 模态内部编码
+
+默认模态encoder与共享主干都使用D=128、4 heads和4D=512的GELU FFN，共用dropout配置；图像和文本深度分别由`vision_layers=2`、`text_layers=2`控制，必须为正，不提供跳过encoder的兼容路径。
+
+**图像：小型ViT。** 每幅图像先以Conv2d做非重叠patch投影，加行/列分开的二维sin/cos位置编码，再过2层pre-LN Transformer与最终LayerNorm。二维位置在模态内attention之前加入，支持可变矩形patch网格。返回所有patch hidden states及对应中心xy坐标；不生成CLS、不做全局池化。每帧独立编码，跨帧、相机及参考/当前段的交互发生在共享主干。
+
+**文本：小型BERT式encoder。** UTF-8字节Embedding(256,D)与可学习位置Embedding相加，经Embedding LayerNorm、dropout和2层双向post-LN/GELU Transformer；保留每个字节的hidden state。每个文本事件独立编码，内部没有padding或因果mask。输入仍使用256项字节词表，不引入WordPiece、CLS/SEP、MLM或NSP头。`max_text_tokens=512`按UTF-8字节计数，超限显式报错。
+
+所有参数随机初始化并可训练，没有预训练模型下载或冻结参数。文本Linear/Embedding与attention投影使用std=0.02正态初始化；ViT及共享Transformer的attention/Linear投影用Xavier初始化。TransformerEncoder克隆出的每一层都重新独立初始化。仅以策略L1损失联合训练，不额外增加预训练任务。
+
+结构参考：[ViT](https://arxiv.org/abs/2010.11929)、[BERT](https://arxiv.org/abs/1810.04805)。这里是适配LOOM的精简架构，不声称等同于官方预训练模型或具备其效果。
+
 ## 统一 token 与共享主干
 
 默认 D=128，四层 pre-LN TransformerEncoder，4 heads、FFN=512，层末 LayerNorm。全注意力，batch padding mask 隔离填充；没有未来观测输入，因此不需要额外的时间因果 attention mask。
 
 | 模态 | 内容映射 | token 数 |
 |---|---|---|
-| RGB | Conv2d(3,D,kernel=16,stride=16) | 每图的 patch 数，64×64 默认16个 |
+| RGB | patch投影 + 2D位置 + 2层ViT | 每图的 patch 数，64×64 默认16个 |
 | state26 | Linear(26,D) → GELU → Linear(D,D) | 每事件1个 |
-| text | UTF-8 byte embedding + sin/cos 字节序号 | 每字节1个 |
+| text | 字节/位置Embedding + 2层BERT式encoder | 每字节1个 |
 | action output | 空内容 + sin/cos 固定槽位序号 | H个，默认8个 |
 
 所有 token 逐一加同一个 metadata MLP 输出：`[tau,x,y,has_xy,E_segment,E_stream,E_modality]`，默认388→128→128。modality 包含 image/state/text/action output 四类。当前段观测 `tau=event.time-time`，参考段相对其可见末端归零，保留真实秒数和异步间隔。图像 x/y 是 patch 中心归一化坐标，其他模态 has_xy=0。
 
-segment/stream 为局部类别 ID，训练时可随机重编号。参考与当前共用权重，不存在独立深视觉塔、CLS 或输入压缩器。action 输出槽绑定当前 segment、使用该段额外保留的 stream ID，tau=0、has_xy=0；槽位编码从0到H−1，与观测数量无关。
+segment/stream 为局部类别 ID，训练时可随机重编号。参考与当前共用同一个ViT、同一个文本encoder及共享主干；不使用CLS或输入压缩器。action 输出槽绑定当前 segment、使用该段额外保留的 stream ID，tau=0、has_xy=0；槽位编码从0到H−1，与观测数量无关。
 
 ## 并行动作读出
 
@@ -57,6 +69,6 @@ segment/stream 为局部类别 ID，训练时可随机重编号。参考与当�
 
 ## 配置与范围
 
-默认每相机4帧、最多32个state事件，显式均匀取样并保留末端；数量可取消限制。`max_tokens` 包含观测和H个输出token，是计算预算，超过报错，不静默截断。时间没有固定最大秒数，但可靠跨度取决于训练覆盖。
+默认每相机4帧、最多32个state事件，显式均匀取样并保留末端；数量可取消限制。`max_tokens`包含全部模态输出和H个action token，是计算预算，超过报错，不静默截断。图像/文本在模态内attention前检查剩余token预算，始终为H个action token预留位置。时间没有固定最大秒数，但可靠跨度取决于训练覆盖。
 
-当前 checkpoint 格式 v5，固定输出时序随模型配置保存。没有多套动作头、兼容实现或生成式采样参数。尚未验证真实数据、GPU、大规模分布式和机器人任务效果。
+当前 checkpoint 格式 v6，固定输出时序随模型配置保存。没有多套动作头、兼容实现或生成式采样参数。尚未验证真实数据、GPU、大规模分布式和机器人任务效果。
