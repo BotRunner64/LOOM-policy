@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loom-policy"
-version = "0.6.0"
-description = "Random-init ViT/BERT encoders with parallel action-token L1 regression"
+version = "1.0.0"
+description = "LOOM policy: per-segment Perceiver reader, shared transformer, direct action-chunk regression"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.2", "numpy>=1.24", "pyarrow>=15", "av>=12", "pillow>=10"]
 
@@ -14,7 +14,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 loom-train = "loom_policy.train:main"
-loom-predict = "loom_policy.predict:main"
+loom-eval = "loom_policy.eval:main"
 
 [tool.setuptools.packages.find]
 include = ["loom_policy*"]

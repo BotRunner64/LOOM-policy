@@ -1,74 +1,65 @@
-"""Body-frame SE(3); export rotations are flattened COLUMN-major."""
+"""Relative-pose features of the 26-d contract state.
+
+Contract state: per arm a pose12 `[x, y, z, R column-major]` (T_reference_eef) and a
+gripper openness; left arm at 0:13, right arm at 13:26.
+
+Feature (20-d, 10 per arm): `[translation 3, rotation 6D, gripper 1]` of the body-frame
+transform `T_base^-1 · T_target`, with the gripper openness of the target taken as is.
+The reference frame of the dataset cancels out. The same feature serves as input
+(base = previous observed frame) and as action (base = frame t for the whole chunk).
+"""
 import numpy as np
 
-
-def pose_to_matrix(pose):
-    p = np.asarray(pose, dtype=np.float64)
-    if p.shape[-1:] != (12,) or not np.isfinite(p).all():
-        raise ValueError("pose must be finite [...,12]")
-    out = np.zeros(p.shape[:-1] + (4, 4), dtype=np.float64)
-    out[..., :3, :3] = p[..., 3:].reshape(p.shape[:-1] + (3, 3)).swapaxes(-1, -2)
-    out[..., :3, 3] = p[..., :3]
-    out[..., 3, 3] = 1
-    r = out[..., :3, :3]
-    if not np.allclose(r.swapaxes(-1, -2) @ r, np.eye(3), atol=1e-4) or not np.allclose(np.linalg.det(r), 1, atol=1e-4):
-        raise ValueError("pose rotation must be in SO(3)")
-    return out
+STATE_DIM = 26
+FEATURE_DIM = 20
 
 
-def matrix_to_pose(t):
-    t = np.asarray(t)
-    return np.concatenate((t[..., :3, 3], t[..., :3, :3].swapaxes(-1, -2).reshape(t.shape[:-2] + (9,))), axis=-1)
+def split(state):
+    """[..., 26] -> translation [..., 2, 3], rotation [..., 2, 3, 3], gripper [..., 2]."""
+    state = np.asarray(state, dtype=np.float64)
+    pose = np.stack((state[..., 0:12], state[..., 13:25]), axis=-2)
+    rotation = np.swapaxes(pose[..., 3:].reshape(*pose.shape[:-1], 3, 3), -1, -2)
+    return pose[..., :3], rotation, state[..., [12, 25]]
 
 
-def relative(anchor, pose):
-    """anchor^-1 @ pose. Each arm has its own unrelated fixed world frame."""
-    a, p = np.asarray(anchor), np.asarray(pose)
-    out = np.zeros(np.broadcast_shapes(a.shape, p.shape))
-    r = a[..., :3, :3].swapaxes(-1, -2)
-    out[..., :3, :3] = r @ p[..., :3, :3]
-    out[..., :3, 3] = (r @ (p[..., :3, 3] - a[..., :3, 3])[..., None])[..., 0]
-    out[..., 3, 3] = 1
-    return out
+def relative(base, target):
+    """Features [..., 20] of `target` relative to `base`; the two broadcast against each other."""
+    base_t, base_r, _ = split(base)
+    target_t, target_r, gripper = split(target)
+    inverse = np.swapaxes(base_r, -1, -2)
+    rotation = inverse @ target_r
+    translation = (inverse @ (target_t - base_t)[..., None])[..., 0]
+    six = np.swapaxes(rotation[..., :, :2], -1, -2).reshape(*rotation.shape[:-2], 6)
+    feature = np.concatenate((translation, six, gripper[..., None]), axis=-1)
+    return feature.reshape(*feature.shape[:-2], FEATURE_DIM).astype(np.float32)
 
 
-def transform_to_action(t, openness):
-    """Per arm: local translation(3), first two rotation columns(6), gripper(1)."""
-    return np.concatenate((t[:3, 3], t[:3, :2].T.reshape(6), [openness])).astype(np.float32)
+def rotation_from_6d(six):
+    """[..., 6] (first two columns, need not be orthonormal) -> rotation matrices [..., 3, 3]."""
+    six = np.asarray(six, dtype=np.float64)
+    x = six[..., :3] / np.linalg.norm(six[..., :3], axis=-1, keepdims=True)
+    z = np.cross(x, six[..., 3:])
+    z /= np.linalg.norm(z, axis=-1, keepdims=True)
+    return np.stack((x, np.cross(z, x), z), axis=-1)
 
 
-def rotation6d_to_matrix(x):
-    """Gram-Schmidt with deterministic fallbacks for degenerate predictions."""
-    x = np.asarray(x, dtype=np.float64).reshape(2, 3)
-    if not np.isfinite(x).all():
-        raise ValueError("Nonfinite rotation prediction")
-    a = x[0]
-    a = a / np.linalg.norm(a) if np.linalg.norm(a) > 1e-8 else np.array([1., 0., 0.])
-    b = x[1] - np.dot(a, x[1]) * a
-    if np.linalg.norm(b) < 1e-8:
-        basis = np.eye(3)[np.argmin(np.abs(a))]
-        b = basis - np.dot(a, basis) * a
-    b /= np.linalg.norm(b)
-    return np.stack((a, b, np.cross(a, b)), axis=1)
+def compose(base, feature):
+    """Inverse of `relative`: contract states [..., 26] of `feature` applied to `base` [26]."""
+    base_t, base_r, _ = split(base)
+    feature = np.asarray(feature, dtype=np.float64).reshape(*np.shape(feature)[:-1], 2, 10)
+    rotation = base_r @ rotation_from_6d(feature[..., 3:9])
+    translation = base_t + (base_r @ feature[..., :3, None])[..., 0]
+    columns = np.swapaxes(rotation, -1, -2).reshape(*rotation.shape[:-2], 9)
+    arms = np.concatenate((translation, columns, feature[..., 9:]), axis=-1)
+    return arms.reshape(*arms.shape[:-2], STATE_DIM).astype(np.float32)
 
 
-def decode_actions(actions, anchors):
-    """[H,20] -> export-format absolute target poses + clipped openness.
-
-    Every horizon shares the same observation anchor (no action accumulation).
-    anchors contains separate left/right 4x4 matrices measured at current time.
-    """
-    a = np.asarray(actions)
-    if a.ndim != 2 or a.shape[1] != 20 or not np.isfinite(a).all():
-        raise ValueError("actions must be finite [H,20]")
-    result = {}
-    for side, offset in (("left", 0), ("right", 10)):
-        poses = []
-        for row in a[:, offset:offset + 10]:
-            delta = np.eye(4)
-            delta[:3, 3] = row[:3]
-            delta[:3, :3] = rotation6d_to_matrix(row[3:9])
-            poses.append(matrix_to_pose(anchors[side] @ delta))
-        result[f"{side}_eef"] = np.asarray(poses).tolist()
-        result[f"{side}_gripper"] = a[:, offset + 9].clip(0, 1).tolist()
-    return result
+def errors(prediction, target):
+    """Mean physical errors between two feature arrays: translation (m), rotation (deg), gripper."""
+    prediction = np.asarray(prediction, dtype=np.float64).reshape(*np.shape(prediction)[:-1], 2, 10)
+    target = np.asarray(target, dtype=np.float64).reshape(prediction.shape)
+    delta = np.swapaxes(rotation_from_6d(prediction[..., 3:9]), -1, -2) @ rotation_from_6d(target[..., 3:9])
+    cosine = np.clip((np.trace(delta, axis1=-2, axis2=-1) - 1) / 2, -1, 1)
+    return {'translation_m': float(np.linalg.norm(prediction[..., :3] - target[..., :3], axis=-1).mean()),
+            'rotation_deg': float(np.degrees(np.arccos(cosine)).mean()),
+            'gripper': float(np.abs(prediction[..., 9] - target[..., 9]).mean())}

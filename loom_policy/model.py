@@ -1,183 +1,166 @@
-"""Observations + action output slots -> shared Transformer -> L1 action chunks."""
-from dataclasses import dataclass
+"""Reader + shared transformer + action slots.
+
+1. Every segment goes through the same reader (Perceiver IO): its image patches,
+   state tokens and text bytes are read by cross-attention into L latents.
+2. The latents of all segments of a sample plus `horizon` action slots go through
+   one full-attention transformer.
+3. Each action slot regresses the action of one future frame; the loss is L1.
+
+Trunk cost does not depend on reference length, and the latents of a reference
+do not depend on the current segment, so deployment encodes a reference once.
+
+Token facts: frame offset (action slot k is offset +k), camera, segment kind;
+plus what a token needs to be read at all (modality, patch position, byte position).
+"""
+import math
+
 import torch
 from torch import nn
-from .events import PolicyInput, ChunkConfig
-from .encoders import ViTEncoder, BertTextEncoder, sequence_positions, reset_transformer
+import torch.nn.functional as F
+
+from loom_policy.geometry import FEATURE_DIM
 
 
-@dataclass(frozen=True)
-class ModelConfig:
-    d_model: int = 128
-    heads: int = 4
-    layers: int = 4
-    vision_layers: int = 2
-    text_layers: int = 2
-    max_text_tokens: int = 512
-    mlp_ratio: int = 4
-    patch_size: int = 16
-    dropout: float = 0.0
-    max_segments: int = 16
-    max_streams: int = 32
-    max_tokens: int = 4096
-    randomize_ids: bool = True
-    chunk_size: int = 8
-    action_interval_ns: int = 50_000_000
-
-    def __post_init__(self):
-        if any(type(x) is not int or x < 1 for x in (
-                self.d_model, self.heads, self.layers, self.vision_layers, self.text_layers,
-                self.max_text_tokens, self.mlp_ratio, self.patch_size,
-                self.max_segments, self.max_streams, self.max_tokens)):
-            raise ValueError("Model sizes and token budget must be positive integers")
-        if self.d_model < 2 or self.d_model % self.heads or not 0 <= self.dropout < 1:
-            raise ValueError("d_model must be >=2 and divisible by heads; dropout must be in [0,1)")
-        self.chunk  # validate the fixed output timing
-
-    @property
-    def chunk(self):
-        return ChunkConfig(self.chunk_size, self.action_interval_ns)
+def pad_groups(values, group, count):
+    """values [T, ...] with group ids [T] -> padded [count, longest, ...] and its mask [count, longest]."""
+    sizes = torch.bincount(group, minlength=count)
+    order = torch.argsort(group, stable=True)
+    position = torch.arange(len(group), device=group.device) - (sizes.cumsum(0) - sizes)[group[order]]
+    padded = values.new_zeros(count, int(sizes.max()), *values.shape[1:])
+    mask = torch.zeros(padded.shape[:2], dtype=torch.bool, device=group.device)
+    padded[group[order], position] = values[order]
+    mask[group[order], position] = True
+    return padded, mask
 
 
-class ActionHead(nn.Module):
-    """Shared MLP: one hidden state per timestep -> the complete action vector."""
-    def __init__(self, width, action_dim):
+class FrameOffset(nn.Module):
+    """Frame offset (any real number of frames) -> embedding, by Fourier features."""
+
+    def __init__(self, dim, bands=32):
         super().__init__()
-        self.input = nn.Sequential(nn.LayerNorm(width),
-                                   nn.Linear(width, width), nn.ReLU())
-        self.blocks = nn.ModuleList([
-            nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.ReLU())
-            for _ in range(2)])
-        self.output = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, action_dim))
+        self.register_buffer('frequency', 2 * math.pi / torch.logspace(math.log10(2), math.log10(20000), bands),
+                             persistent=False)
+        self.project = nn.Linear(2 * bands, dim)
 
-    def forward(self, states):
-        # [B,H,D] -> [B,H,action_dim]; the same head is applied to every step.
-        value = self.input(states)
-        for block in self.blocks:
-            value = value + block(value)
-        return self.output(value)
+    def forward(self, offset):
+        angle = offset.float()[..., None] * self.frequency
+        return self.project(torch.cat((angle.sin(), angle.cos()), -1))
+
+
+class Block(nn.Module):
+    """Pre-LN attention + MLP; attends to `context` when given, to itself otherwise."""
+
+    def __init__(self, dim, heads, cross=False):
+        super().__init__()
+        self.heads = heads
+        self.norm, self.norm_context = nn.LayerNorm(dim), nn.LayerNorm(dim) if cross else None
+        self.query, self.key_value, self.out = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim), nn.Linear(dim, dim)
+        self.norm_mlp = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+
+    def forward(self, x, context=None, mask=None):
+        """mask [B, N] marks the real tokens of what is attended to."""
+        query = self.norm(x)
+        context = query if context is None else self.norm_context(context)
+        split = lambda t: t.unflatten(-1, (self.heads, -1)).transpose(1, 2)
+        key, value = self.key_value(context).chunk(2, -1)
+        attended = F.scaled_dot_product_attention(
+            split(self.query(query)), split(key), split(value),
+            attn_mask=None if mask is None else mask[:, None, None])
+        x = x + self.out(attended.transpose(1, 2).flatten(2))
+        return x + self.mlp(self.norm_mlp(x))
 
 
 class LoomPolicy(nn.Module):
-    state_dim = 26
-    action_dim = 20
-
-    def __init__(self, config=None):
+    def __init__(self, config, stats=None):
         super().__init__()
-        self.config = c = config or ModelConfig()
-        d = c.d_model
-        self.image_encoder = ViTEncoder(d, c.heads, c.vision_layers, c.mlp_ratio, c.patch_size, c.dropout)
-        self.text_encoder = BertTextEncoder(d, c.heads, c.text_layers, c.mlp_ratio, c.max_text_tokens, c.dropout)
-        self.state = nn.Sequential(nn.Linear(self.state_dim, d), nn.GELU(), nn.Linear(d, d))
-        self.segment = nn.Embedding(c.max_segments, d)
-        self.stream = nn.Embedding(c.max_streams, d)
-        self.modality = nn.Embedding(4, d)  # image, state, text, action output
-        self.meta = nn.Sequential(nn.Linear(4 + 3 * d, d), nn.GELU(), nn.Linear(d, d))
-        layer = nn.TransformerEncoderLayer(d, c.heads, c.mlp_ratio * d, c.dropout,
-                                          batch_first=True, norm_first=True, activation="gelu")
-        self.backbone = nn.TransformerEncoder(layer, c.layers, nn.LayerNorm(d), enable_nested_tensor=False)
-        self.action_head = ActionHead(d, self.action_dim)
-        reset_transformer(self.backbone)
+        self.config = config
+        dim, heads = config.dim, config.heads
+        patches = (config.image_size[0] // config.patch) * (config.image_size[1] // config.patch)
+        parameter = lambda *shape: nn.Parameter(torch.randn(*shape) * 0.02)
 
-    def metadata(self, continuous, segment, stream, modality):
-        n = continuous.shape[0]
-        return self.meta(torch.cat((continuous, self.segment.weight[segment].expand(n, -1),
-                                   self.stream.weight[stream].expand(n, -1),
-                                   self.modality.weight[modality].expand(n, -1)), dim=-1))
+        # Tokens.
+        self.patch = nn.Conv2d(3, dim, config.patch, config.patch)
+        self.patch_position = parameter(patches, dim)
+        self.state = nn.Sequential(nn.Linear(FEATURE_DIM, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.byte = nn.Embedding(256, dim)
+        self.byte_position = nn.Embedding(config.max_text_bytes, dim)
+        self.offset = FrameOffset(dim)
+        self.modality, self.camera, self.kind = nn.Embedding(3, dim), nn.Embedding(3, dim), nn.Embedding(2, dim)
 
-    def tokenize(self, inputs: PolicyInput):
-        c = self.config
-        device, dtype = self.segment.weight.device, self.segment.weight.dtype
-        segments = inputs.visible()
-        if len(segments) > c.max_segments:
-            raise ValueError("Too many segments; increase max_segments")
-        seg_ids = torch.arange(len(segments), device=device)
-        if self.training and c.randomize_ids:
-            seg_ids = torch.randperm(c.max_segments, device=device)[:len(segments)]
-        pieces = []
-        count = 0
+        # Reader.
+        self.latents = parameter(config.num_latents, dim)
+        self.reader = nn.ModuleList(
+            nn.ModuleList([Block(dim, heads, cross=True), *(Block(dim, heads) for _ in range(config.reader_self_layers))])
+            for _ in range(config.reader_blocks))
+        self.reader_norm = nn.LayerNorm(dim)
 
-        def append(content, tau, xy, sid, rid, modality):
-            nonlocal count
-            n = content.shape[0]
-            count += n
-            if count > c.max_tokens:
-                raise ValueError(f"{count} tokens exceed max_tokens={c.max_tokens}; adjust explicit data sampling")
-            continuous = torch.zeros((n, 4), device=device, dtype=dtype)
-            continuous[:, 0] = tau
-            if xy is not None:
-                continuous[:, 1:3] = xy
-                continuous[:, 3] = 1
-            pieces.append(content + self.metadata(continuous, sid, rid, modality))
+        # Trunk.
+        self.latent_position = parameter(config.num_latents, dim)
+        self.latent_kind = nn.Embedding(2, dim)
+        self.slot = parameter(dim)
+        self.trunk = nn.ModuleList(Block(dim, heads) for _ in range(config.trunk_layers))
+        self.trunk_norm = nn.LayerNorm(dim)
+        self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, FEATURE_DIM))
 
-        action_segment = action_stream = None
-        for index, seg in enumerate(segments):
-            sid = seg_ids[index]
-            current = seg.segment_id == inputs.current.segment_id
-            anchor = inputs.time if current else max((e.time for e in seg.events), default=0)
-            streams = sorted({e.stream_id for e in seg.events})
-            count_streams = len(streams) + int(current)
-            if count_streams > c.max_streams:
-                raise ValueError("Too many streams; current segment also needs one action-output stream")
-            stream_ids = torch.arange(count_streams, device=device)
-            if self.training and c.randomize_ids:
-                stream_ids = torch.randperm(c.max_streams, device=device)[:count_streams]
-            mapping = dict(zip(streams, stream_ids))
-            for event in seg.events:
-                tau = event.time - anchor
-                rid = mapping[event.stream_id]
-                if event.modality == "image":
-                    value = torch.as_tensor(event.value, device=device, dtype=dtype)
-                    content, xy = self.image_encoder(value, token_budget=c.max_tokens - count - c.chunk_size)
-                    append(content, tau, xy, sid, rid, 0)
-                elif event.modality == "state":
-                    value = torch.as_tensor(event.value, device=device, dtype=dtype)
-                    if value.shape != (self.state_dim,) or not torch.isfinite(value).all():
-                        raise ValueError("state must be finite [26]")
-                    append(self.state(value[None]), tau, None, sid, rid, 1)
-                else:
-                    content = self.text_encoder(event.value, token_budget=c.max_tokens - count - c.chunk_size)
-                    append(content, tau, None, sid, rid, 2)
-            if current:
-                action_segment, action_stream = sid, stream_ids[-1]
-        start = count
-        # Empty content, distinguished by fixed slot position. Our backbone
-        # has no built-in positional encoding, so supply it explicitly.
-        slots = sequence_positions(c.chunk_size, c.d_model, device, dtype)
-        append(slots, 0., None, action_segment, action_stream, 3)
-        return torch.cat(pieces), slice(start, count)
+        for name in ('input_mean', 'input_std', 'action_mean', 'action_std'):
+            value = torch.tensor(stats[name]) if stats else torch.full((FEATURE_DIM,), float(name.endswith('std')))
+            self.register_buffer(name, value.float())
 
-    def forward(self, inputs: list[PolicyInput]):
-        """One forward pass -> [batch, chunk_size,20] continuous actions."""
-        if not inputs:
-            raise ValueError("Empty batch")
-        tokenized = [self.tokenize(sample) for sample in inputs]
-        longest = max(len(tokens) for tokens, _ in tokenized)
-        tokens = self.segment.weight.new_zeros(len(inputs), longest, self.config.d_model)
-        padding = torch.ones((len(inputs), longest), device=tokens.device, dtype=torch.bool)
-        for i, (value, _) in enumerate(tokenized):
-            tokens[i, :len(value)] = value
-            padding[i, :len(value)] = False
-        hidden = self.backbone(tokens, src_key_padding_mask=padding)
-        states = torch.stack([hidden[i, span] for i, (_, span) in enumerate(tokenized)])
-        return self.action_head(states)
+    def encode(self, batch):
+        """Segments of a collated batch -> latents [segments, L, dim]."""
+        kind = batch['seg_kind']
+        tokens, group = [], []
+        if 'images' in batch:
+            image = self.patch(batch['images'].float() / 127.5 - 1).flatten(2).transpose(1, 2)
+            fact = self.offset(batch['img_off']) + self.camera(batch['img_cam']) + self.modality.weight[0]
+            tokens.append((image + self.patch_position + fact[:, None]).flatten(0, 1))
+            group.append(batch['img_seg'].repeat_interleave(image.shape[1]))
+        state = (batch['state'] - self.input_mean) / self.input_std
+        tokens.append(self.state(state) + self.offset(batch['st_off']) + self.modality.weight[1])
+        group.append(batch['st_seg'])
+        if 'text' in batch:
+            tokens.append(self.byte(batch['text']) + self.byte_position(batch['txt_pos'])
+                          + self.offset(batch['txt_off']) + self.modality.weight[2])
+            group.append(batch['txt_seg'])
+        group = torch.cat(group)
+        tokens = torch.cat(tokens) + self.kind(kind)[group]
 
+        # Read the segments of each kind as one padded batch: current segments are much shorter than
+        # references, and padding them to reference length would waste most of the reader's memory.
+        latents, order = [], []
+        for value in kind.unique():
+            segments = (kind == value).nonzero()[:, 0]
+            renumber = torch.zeros_like(kind).index_put_((segments,), torch.arange(len(segments), device=kind.device))
+            chosen = kind[group] == value
+            padded, mask = pad_groups(tokens[chosen], renumber[group[chosen]], len(segments))
+            read = self.latents.expand(len(segments), -1, -1)
+            for cross, *layers in self.reader:
+                read = cross(read, padded, mask)
+                for layer in layers:
+                    read = layer(read)
+            latents.append(read)
+            order.append(segments)
+        return self.reader_norm(torch.cat(latents)[torch.argsort(torch.cat(order))])
 
-def masked_l1_loss(predictions, samples):
-    """OFT-style continuous L1 objective; missing fields have no gradients."""
-    if len(predictions) != len(samples) or not samples:
-        raise ValueError("A nonempty aligned batch is required")
-    total = predictions.new_zeros(())
-    count = 0
-    for pred, sample in zip(predictions, samples, strict=True):
-        target = sample["target"].to(pred)
-        mask = sample["mask"].to(device=pred.device, dtype=torch.bool)
-        if target.shape != pred.shape or mask.shape != pred.shape:
-            raise ValueError("Target/mask must match the configured [chunk_size,20]")
-        if not torch.isfinite(target[mask]).all():
-            raise ValueError("Nonfinite supervised target")
-        total = total + (pred[mask] - target[mask]).abs().sum()
-        count += int(mask.sum())
-    if count == 0:
-        raise ValueError("No supervised action fields")
-    return total / count
+    def decode(self, latents, seg_sample, seg_kind, samples):
+        """Latents of all segments -> normalized actions [samples, horizon, 20]."""
+        horizon = self.config.horizon
+        latents = latents + self.latent_position + self.latent_kind(seg_kind)[:, None]
+        latents, mask = pad_groups(latents, seg_sample, samples)
+        mask = mask.repeat_interleave(latents.shape[2], 1)
+        slots = self.slot + self.offset(torch.arange(1, horizon + 1, device=latents.device))
+        x = torch.cat((latents.flatten(1, 2), slots.expand(samples, -1, -1)), 1)
+        mask = torch.cat((mask, mask.new_ones(samples, horizon)), 1)
+        for layer in self.trunk:
+            x = layer(x, mask=mask)
+        return self.head(self.trunk_norm(x[:, -horizon:]))
+
+    def forward(self, batch):
+        """Collated batch -> (L1 loss in normalized space, actions [B, horizon, 20] in feature units)."""
+        samples = int(batch['seg_sample'].max()) + 1
+        prediction = self.decode(self.encode(batch), batch['seg_sample'], batch['seg_kind'], samples).float()
+        actions = prediction * self.action_std + self.action_mean
+        if 'target' not in batch:
+            return None, actions
+        return F.l1_loss(prediction, (batch['target'] - self.action_mean) / self.action_std), actions
