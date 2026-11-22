@@ -102,6 +102,7 @@ class LoomPolicy(nn.Module):
         self.latent_position = parameter(config.num_latents, dim)
         self.latent_kind = nn.Embedding(2, dim)
         self.slot = parameter(dim)
+        self.prefix_proj = nn.Linear(FEATURE_DIM, dim)
         width = config.trunk_dim
         self.trunk_in = nn.Identity() if dim == width else nn.Linear(dim, width)
         self.trunk = nn.ModuleList(Block(width, config.trunk_heads) for _ in range(config.trunk_layers))
@@ -174,8 +175,8 @@ class LoomPolicy(nn.Module):
                 latents[index] = result
         return tuple(latents) if self.config.share_reference_budget else torch.stack(latents)
 
-    def decode(self, latents, seg_sample, seg_kind, samples):
-        """Latents of all segments -> normalized actions [samples, horizon, 20]."""
+    def decode(self, latents, seg_sample, seg_kind, samples, prefix_norm=None, prefix_mask=None):
+        """Decode actions, optionally replacing slots selected by prefix_mask with normalized actions."""
         horizon = self.config.horizon
         counts = seg_sample.new_tensor([len(segment) for segment in latents])
         latents = torch.cat(tuple(latents))
@@ -184,8 +185,11 @@ class LoomPolicy(nn.Module):
         position = torch.arange(len(latents), device=latents.device) - (counts.cumsum(0) - counts)[segment]
         latents = latents + self.latent_position[position] + self.latent_kind(seg_kind)[segment]
         latents, mask = pad_groups(latents, seg_sample[segment], samples)
-        slots = self.slot + self.offset(torch.arange(1, horizon + 1, device=latents.device))
-        x = self.trunk_in(torch.cat((latents, slots.expand(samples, -1, -1)), 1))
+        content = self.slot.expand(samples, horizon, -1)
+        if prefix_norm is not None:
+            content = torch.where(prefix_mask[..., None], self.prefix_proj(prefix_norm), content)
+        slots = content + self.offset(torch.arange(1, horizon + 1, device=latents.device))
+        x = self.trunk_in(torch.cat((latents, slots), 1))
         mask = torch.cat((mask, mask.new_ones(samples, horizon)), 1)
         for layer in self.trunk:
             x = layer(x, mask=mask)
@@ -194,8 +198,21 @@ class LoomPolicy(nn.Module):
     def forward(self, batch):
         """Collated batch -> (L1 loss in normalized space, actions [B, horizon, 20] in feature units)."""
         samples = int(batch['seg_sample'].max()) + 1
-        prediction = self.decode(self.encode(batch), batch['seg_sample'], batch['seg_kind'], samples).float()
+        target = None
+        prefix_norm = prefix_mask = None
+        if 'target' in batch:
+            target = (batch['target'] - self.action_mean) / self.action_std
+            if self.training:
+                max_len = min(self.config.max_prefix_len, self.config.horizon - 1)
+                lengths = torch.randint(max_len + 1, (samples,), device=target.device)
+                prefix_mask = torch.arange(self.config.horizon, device=target.device) < lengths[:, None]
+                prefix_norm = target.masked_fill(~prefix_mask[..., None], 0)
+        prediction = self.decode(self.encode(batch), batch['seg_sample'], batch['seg_kind'], samples,
+                                 prefix_norm, prefix_mask).float()
         actions = prediction * self.action_std + self.action_mean
-        if 'target' not in batch:
+        if target is None:
             return None, actions
-        return F.l1_loss(prediction, (batch['target'] - self.action_mean) / self.action_std), actions
+        if prefix_mask is not None:
+            error = (prediction - target).abs().mean(dim=-1)
+            return error.masked_fill(prefix_mask, 0).sum() / (~prefix_mask).sum(), actions
+        return F.l1_loss(prediction, target), actions

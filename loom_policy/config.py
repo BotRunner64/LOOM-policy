@@ -28,6 +28,7 @@ class Config:
     trunk_heads: int | None = 40
 
     # Training.
+    max_prefix_len: int = 4          # upper bound on known actions, always leaving one frame to predict
     batch_size: int = 32
     steps: int = 100_000
     lr: float = 3e-4
@@ -45,6 +46,8 @@ class Config:
 
     def __post_init__(self):
         self.image_size = tuple(self.image_size)
+        if type(self.max_prefix_len) is not int or self.max_prefix_len < 0 or self.horizon < 1:
+            raise ValueError('max_prefix_len must be a nonnegative integer and horizon must be positive')
         if self.trunk_dim is None:
             self.trunk_dim = self.dim
         if self.trunk_heads is None:

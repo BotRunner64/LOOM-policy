@@ -8,6 +8,7 @@ from loom_policy.eval import evaluate, load_model
 from loom_policy.data import Samples
 from loom_policy.policy import Policy
 from loom_policy.data import Source
+from loom_policy.geometry import relative
 
 
 def run(dataset, directory, steps):
@@ -49,6 +50,24 @@ def test_train_resume_evaluate_and_act(dataset, tmp_path):
         [v.shape for v in frame] for frame in offline['images']]
     without = policy.act(states[[20, 23]], images, cameras, 'pick the cup', previous=states[17])
     assert without.shape == (8, 26)
+    def act(prefix):
+        return policy.act(states[[20, 23]], images, cameras, 'pick the cup', previous=states[17],
+                          prefix_states=prefix)
+
+    np.testing.assert_array_equal(act(states[:0]), without)
+    prefix = states[24:28].copy()
+    projected = []
+    hook = policy.model.prefix_proj.register_forward_pre_hook(lambda module, args: projected.append(args[0]))
+    chunk = act(prefix)
+    hook.remove()
+    expected = (torch.from_numpy(relative(states[23], prefix)) - model.action_mean) / model.action_std
+    torch.testing.assert_close(projected[0][0, :4], expected)
+    np.testing.assert_array_equal(chunk[:4], prefix)
+    prefix[:, 0] += 0.01
+    changed = act(prefix)
+    np.testing.assert_array_equal(changed[:4], prefix)
+    assert np.max(np.abs(changed[4:] - chunk[4:])) > 1e-6
+    np.testing.assert_array_equal(act(states[24:32]), states[24:32])
     rotation = without[:, 3:12].reshape(8, 3, 3)
     np.testing.assert_allclose(rotation @ rotation.transpose(0, 2, 1), np.tile(np.eye(3), (8, 1, 1)), atol=1e-5)
     reference_states, _ = source.frames(2)

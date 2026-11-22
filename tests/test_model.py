@@ -28,10 +28,38 @@ def make(dataset, config, refs):
 
 def test_forward_and_backward(dataset, config):
     model, drawn = make(dataset, config, [0, 2, 1])
+    model.train()
     loss, actions = model(collate(drawn))
     assert actions.shape == (3, 8, 20) and loss.item() > 0
     loss.backward()
     assert all(p.grad is not None for p in model.parameters())
+
+
+def test_prefix_replaces_slot_content_and_only_suffix_is_supervised(dataset, config, monkeypatch):
+    model, drawn = make(dataset, config, [0, 1])
+    model.train()
+    batch = collate(drawn)
+    model.action_mean.fill_(0.5)
+    model.action_std.fill_(2)
+    lengths = torch.tensor([0, 4])
+    monkeypatch.setattr(torch, 'randint', lambda high, size, device: lengths.to(device))
+    inputs = []
+    hook = model.trunk_in.register_forward_pre_hook(lambda module, args: inputs.append(args[0].detach()))
+    loss, actions = model(batch)
+    hook.remove()
+    offsets = model.offset(torch.arange(1, config.horizon + 1))
+    target = (batch['target'] - model.action_mean) / model.action_std
+    slots = inputs[0][:, -config.horizon:]
+    torch.testing.assert_close(slots[0], model.slot + offsets)
+    torch.testing.assert_close(slots[1, :4], model.prefix_proj(target[1, :4]) + offsets[:4])
+    torch.testing.assert_close(slots[1, 4:], model.slot + offsets[4:])
+
+    suffix = torch.arange(config.horizon) >= lengths[:, None]
+    error = (actions - batch['target']).abs() / model.action_std
+    torch.testing.assert_close(loss, error[suffix].mean())
+    # With the same observations and known prefix, changing suffix labels cannot change predictions.
+    batch['target'][suffix] += 10
+    torch.testing.assert_close(model(batch)[1], actions)
 
 
 def test_a_sample_does_not_depend_on_its_batch(dataset, config):
@@ -82,4 +110,4 @@ def test_default_model_is_2b():
     assert model.latents.shape == (256, 512)
     assert model.trunk_in.weight.shape == (2560, 512)
     assert len(model.trunk) == 25 and all(layer.heads == 40 for layer in model.trunk)
-    assert sum(p.numel() for p in model.parameters()) == 1_995_083_796
+    assert sum(p.numel() for p in model.parameters()) == 1_995_094_548
