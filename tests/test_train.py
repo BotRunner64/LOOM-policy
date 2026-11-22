@@ -35,7 +35,7 @@ def test_rebot_single_absolute_state(dataset, tmp_path):
     np.testing.assert_allclose(sample['target'], relative(states[t], states[t+1:t+51]))
 
     model = LoomPolicy(config, statistics([dataset], config))
-    assert model.input_std.shape == (26,) and model.action_std.shape == (20,)
+    assert model.input_scale.shape == (26,) and model.action_scale.shape == (20,)
     loss, actions = model(collate([sample]))
     loss.backward()
     assert torch.isfinite(loss) and actions.shape == (1, 50, 20)
@@ -75,7 +75,7 @@ def test_train_resume_evaluate_and_act(dataset, tmp_path):
     assert [r['step'] for r in records] == [2, 4, 6, 8] and 'val_translation_m' in records[-1]
 
     model = load_model(tmp_path / 'last.pt', torch.device('cpu'))
-    assert model.action_std.max() != 1  # statistics travel with the checkpoint
+    assert 0 < model.action_scale.min() < 1  # statistics travel with the checkpoint
     metrics = evaluate(model, Samples([dataset], model.config, split='val', num_refs=1), 1, 2, torch.device('cpu'))
     assert set(metrics) == {'loss', 'translation_m', 'rotation_deg', 'gripper'}
 
@@ -100,7 +100,7 @@ def test_train_resume_evaluate_and_act(dataset, tmp_path):
     hook = policy.model.prefix_proj.register_forward_pre_hook(lambda module, args: projected.append(args[0]))
     chunk = act(prefix)
     hook.remove()
-    expected = (torch.from_numpy(relative(states[23], prefix)) - model.action_mean) / model.action_std
+    expected = (torch.from_numpy(relative(states[23], prefix)) - model.action_center) / model.action_scale
     torch.testing.assert_close(projected[0][0, :4], expected)
     np.testing.assert_array_equal(chunk[:4], prefix)
     prefix[:, 0] += 0.01

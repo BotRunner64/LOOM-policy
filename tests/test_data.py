@@ -85,7 +85,14 @@ def test_split_and_statistics(dataset, config):
     with pytest.raises(ValueError, match='references asked'):
         train.sample(np.random.default_rng(0))
     stats = statistics([dataset], config)
-    assert all(len(stats[key]) == 20 for key in ('input_mean', 'input_std', 'action_mean', 'action_std'))
+    assert all(len(stats[key]) == 20 for key in ('input_center', 'input_scale', 'action_center', 'action_scale'))
+    rng = np.random.default_rng(config.seed)
+    samples = Samples([dataset], config, images=False)
+    targets = np.concatenate([samples.sample(rng)['target'].numpy() for _ in range(config.stats_samples)])
+    q01, q99 = np.quantile(targets[:, 0], [0.01, 0.99])
+    np.testing.assert_allclose((stats['action_center'][0], stats['action_scale'][0]),
+                               ((q01 + q99) / 2, (q99 - q01) / 2))
+    assert stats['action_center'][3:9] == [0.] * 6 and stats['action_scale'][3:9] == [1.] * 6
 
 
 def test_rebot_quantile_statistics(config, tmp_path):
@@ -101,7 +108,7 @@ def test_rebot_quantile_statistics(config, tmp_path):
     (tmp_path / 'norm_stats.json').write_text(json.dumps({'norm_stats': source}))
     stats = statistics([], config)
     for group, dim in [('input', 26), ('action', 20)]:
-        center, scale = (np.asarray(stats[f'{group}_{suffix}']) for suffix in ('mean', 'std'))
+        center, scale = (np.asarray(stats[f'{group}_{suffix}']) for suffix in ('center', 'scale'))
         assert center.shape == scale.shape == (dim,)
         np.testing.assert_allclose((np.array([2, 6, 10, 14]) - center[0]) / scale[0], [-1, 0, 1, 2])
         assert center[3] == 0 and scale[3] == 1

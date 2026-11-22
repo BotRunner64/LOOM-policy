@@ -59,7 +59,7 @@ class Policy:
                 return prefix_states.copy()
             if length:
                 prefix = torch.as_tensor(relative(states[-1], prefix_states), device=self.device)
-                normalized = (prefix - self.model.action_mean) / self.model.action_std
+                normalized = (prefix - self.model.action_center) / self.model.action_scale
                 prefix_norm = normalized.new_zeros(1, self.config.horizon, normalized.shape[-1])
                 prefix_norm[0, :length] = normalized
                 prefix_mask = torch.arange(self.config.horizon, device=self.device)[None, :] < length
@@ -71,6 +71,6 @@ class Policy:
         kinds = torch.tensor(kinds, device=self.device)
         with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
             actions = self.model.decode(latents, torch.zeros_like(kinds), kinds, 1, prefix_norm, prefix_mask).float()
-        actions = actions * self.model.action_std + self.model.action_mean
+        actions = actions * self.model.action_scale + self.model.action_center
         suffix = compose(states[-1], actions[0, length:].cpu().numpy())
         return np.concatenate((prefix_states, suffix)) if length else suffix

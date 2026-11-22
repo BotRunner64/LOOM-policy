@@ -111,7 +111,7 @@ class LoomPolicy(nn.Module):
         self.head = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, FEATURE_DIM))
 
         for group, size in (('input', input_dim), ('action', FEATURE_DIM)):
-            for suffix, default in (('mean', 0.), ('std', 1.)):
+            for suffix, default in (('center', 0.), ('scale', 1.)):
                 name = f'{group}_{suffix}'
                 value = torch.tensor(stats[name]) if stats else torch.full((size,), default)
                 self.register_buffer(name, value.float())
@@ -149,7 +149,7 @@ class LoomPolicy(nn.Module):
             fact = self.offset(views['off']) + self.camera(views['cam']) + self.modality.weight[0]
             tokens.append((image + position + fact[:, None]).flatten(0, 1))
             group.append(views['seg'].repeat_interleave(image.shape[1]))
-        state = (batch['state'] - self.input_mean) / self.input_std
+        state = (batch['state'] - self.input_center) / self.input_scale
         tokens.append(self.state(state) + self.offset(batch['st_off']) + self.modality.weight[1])
         group.append(batch['st_seg'])
         if 'text' in batch:
@@ -204,7 +204,7 @@ class LoomPolicy(nn.Module):
         target = None
         prefix_norm = prefix_mask = None
         if 'target' in batch:
-            target = (batch['target'] - self.action_mean) / self.action_std
+            target = (batch['target'] - self.action_center) / self.action_scale
             if self.training:
                 max_len = min(self.config.max_prefix_len, self.config.horizon - 1)
                 lengths = torch.randint(max_len + 1, (samples,), device=target.device)
@@ -212,7 +212,7 @@ class LoomPolicy(nn.Module):
                 prefix_norm = target.masked_fill(~prefix_mask[..., None], 0)
         prediction = self.decode(self.encode(batch), batch['seg_sample'], batch['seg_kind'], samples,
                                  prefix_norm, prefix_mask).float()
-        actions = prediction * self.action_std + self.action_mean
+        actions = prediction * self.action_scale + self.action_center
         if target is None:
             return None, actions
         if prefix_mask is not None:

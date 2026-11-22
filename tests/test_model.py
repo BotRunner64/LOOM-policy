@@ -39,8 +39,8 @@ def test_prefix_replaces_slot_content_and_only_suffix_is_supervised(dataset, con
     model, drawn = make(dataset, config, [0, 1])
     model.train()
     batch = collate(drawn)
-    model.action_mean.fill_(0.5)
-    model.action_std.fill_(2)
+    model.action_center.fill_(0.5)
+    model.action_scale.fill_(2)
     lengths = torch.tensor([0, 4])
     monkeypatch.setattr(torch, 'randint', lambda high, size, device: lengths.to(device))
     inputs = []
@@ -48,14 +48,14 @@ def test_prefix_replaces_slot_content_and_only_suffix_is_supervised(dataset, con
     loss, actions = model(batch)
     hook.remove()
     offsets = model.offset(torch.arange(1, config.horizon + 1))
-    target = (batch['target'] - model.action_mean) / model.action_std
+    target = (batch['target'] - model.action_center) / model.action_scale
     slots = inputs[0][:, -config.horizon:]
     torch.testing.assert_close(slots[0], model.slot + offsets)
     torch.testing.assert_close(slots[1, :4], model.prefix_proj(target[1, :4]) + offsets[:4])
     torch.testing.assert_close(slots[1, 4:], model.slot + offsets[4:])
 
     suffix = torch.arange(config.horizon) >= lengths[:, None]
-    error = (actions - batch['target']).abs() / model.action_std
+    error = (actions - batch['target']).abs() / model.action_scale
     torch.testing.assert_close(loss, error[suffix].mean())
     # With the same observations and known prefix, changing suffix labels cannot change predictions.
     batch['target'][suffix] += 10
@@ -82,7 +82,7 @@ def test_reference_changes_the_prediction_and_can_be_encoded_once(dataset, confi
         latents = (*model.encode(collate([{'segments': current}])), *cached)
         kinds = torch.tensor([0, 1, 1])
         split = model.decode(latents, torch.zeros(3, dtype=torch.long), kinds, 1)
-        torch.testing.assert_close(split * model.action_std + model.action_mean, full, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(split * model.action_scale + model.action_center, full, atol=1e-5, rtol=1e-4)
 
 
 def test_current_and_all_references_each_get_one_budget(dataset, config):

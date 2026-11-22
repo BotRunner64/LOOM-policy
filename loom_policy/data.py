@@ -274,20 +274,8 @@ class Samples(torch.utils.data.IterableDataset):
             yield self.sample(rng)
 
 
-def statistics(roots, config):
-    """Affine normalization parameters for both observation states and action chunks."""
-    if config.rebot_quantile_stats:
-        source = json.loads(Path(config.rebot_quantile_stats).read_text())['norm_stats']
-        result = {}
-        for key, group, dim in [('state', 'input', STATE_DIM), ('actions', 'action', FEATURE_DIM)]:
-            lo, hi = (np.asarray(source[key][q], dtype=np.float64) for q in ('q01', 'q99'))
-            if lo.shape != (dim,) or hi.shape != (dim,) or not np.isfinite([lo, hi]).all() or np.any(hi <= lo):
-                raise ValueError(f'Invalid {key} quantile bounds in {config.rebot_quantile_stats}')
-            # The ReBot exporter sets rotation bounds to [-1, 1], giving center=0 and scale=1.
-            # These checkpoint buffers also feed prefix encoding and output denormalization.
-            result[f'{group}_mean'] = ((hi + lo) / 2).tolist()
-            result[f'{group}_std'] = ((hi - lo) / 2).tolist()
-        return result
+def sampled_quantiles(roots, config):
+    """Estimate raw per-feature bounds from training observations and future actions."""
     samples = Samples(roots, config, seed=config.seed, images=False)
     rng = np.random.default_rng(config.seed)
     inputs, targets = [], []
@@ -296,8 +284,29 @@ def statistics(roots, config):
         inputs += [segment['state'] for segment in sample['segments']]
         targets.append(sample['target'])
     result = {}
-    for name, values in (('input', inputs), ('action', targets)):
-        values = torch.cat(values).double()
-        result[f'{name}_mean'] = values.mean(0).tolist()
-        result[f'{name}_std'] = values.std(0).clamp_min(1e-3).tolist()
+    for name, values in (('state', inputs), ('actions', targets)):
+        lo, hi = np.quantile(torch.cat(values).numpy(), [0.01, 0.99], axis=0)
+        result[name] = {'q01': lo, 'q99': hi}
+    return result
+
+
+def statistics(roots, config):
+    """P1/P99 affine parameters. Rotation coordinates retain their native scale."""
+    if config.rebot_quantile_stats:
+        bounds = json.loads(Path(config.rebot_quantile_stats).read_text())['norm_stats']
+    else:
+        bounds = sampled_quantiles(roots, config)
+    result = {}
+    input_dim = STATE_DIM if config.absolute_state else FEATURE_DIM
+    for key, group, dim in [('state', 'input', input_dim), ('actions', 'action', FEATURE_DIM)]:
+        lo, hi = (np.asarray(bounds[key][q], dtype=np.float64) for q in ('q01', 'q99'))
+        if lo.shape != (dim,) or hi.shape != (dim,) or not np.isfinite([lo, hi]).all() or np.any(hi < lo):
+            raise ValueError(f'Invalid {key} quantile bounds')
+        center, scale = (hi + lo) / 2, (hi - lo) / 2
+        scale[scale < 1e-6] = 1  # Center near-constant coordinates without amplifying noise.
+        # Each arm has xyz, rotation (9D absolute or 6D relative), and gripper.
+        center.reshape(2, -1)[:, 3:-1] = 0
+        scale.reshape(2, -1)[:, 3:-1] = 1
+        result[f'{group}_center'] = center.tolist()
+        result[f'{group}_scale'] = scale.tolist()
     return result
