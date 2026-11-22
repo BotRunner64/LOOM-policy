@@ -10,7 +10,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 
 from loom_policy.config import Config
-from loom_policy.data import Samples, collate, find_datasets, statistics
+from loom_policy.data import Samples, batch_to, collate, find_datasets, statistics
 from loom_policy.eval import evaluate
 from loom_policy.model import LoomPolicy
 
@@ -32,7 +32,7 @@ def main(argv=None):
     checkpoint = args.output / 'last.pt'
     state = torch.load(checkpoint, map_location='cpu', weights_only=True) if checkpoint.exists() else None
     # A resumed run keeps its own config; only a new run reads --config and --set.
-    config = Config(**state['config']) if state else Config.load(args.config, args.set)
+    config = Config.from_checkpoint(state['config']) if state else Config.load(args.config, args.set)
     roots = find_datasets(args.data)
     model = LoomPolicy(config, None if state else statistics(roots, config)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -62,7 +62,7 @@ def main(argv=None):
     model.train()
     started, window = time.time(), 0.
     while step < config.steps:
-        batch = {key: value.to(device, non_blocking=True) for key, value in next(loader).items()}
+        batch = batch_to(next(loader), device)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=cuda):
             loss, _ = parallel(batch)
         optimizer.zero_grad(set_to_none=True)

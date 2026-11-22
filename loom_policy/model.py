@@ -1,7 +1,8 @@
 """Reader + shared transformer + action slots.
 
 1. Every segment goes through the same reader (Perceiver IO): its image patches,
-   state tokens and text bytes are read by cross-attention into L latents.
+   state tokens and text bytes are read by cross-attention. The current segment
+   and the set of references each get one latent budget per sample.
 2. The latents of all segments of a sample plus `horizon` action slots go through
    one full-attention transformer.
 3. Each action slot regresses the action of one future frame; the loss is L1.
@@ -12,12 +13,14 @@ do not depend on the current segment, so deployment encodes a reference once.
 Token facts: frame offset (action slot k is offset +k), camera, segment kind;
 plus what a token needs to be read at all (modality, patch position, byte position).
 """
+from collections import defaultdict
 import math
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
+from loom_policy.data import REFERENCE
 from loom_policy.geometry import FEATURE_DIM
 
 
@@ -99,23 +102,49 @@ class LoomPolicy(nn.Module):
         self.latent_position = parameter(config.num_latents, dim)
         self.latent_kind = nn.Embedding(2, dim)
         self.slot = parameter(dim)
-        self.trunk = nn.ModuleList(Block(dim, heads) for _ in range(config.trunk_layers))
-        self.trunk_norm = nn.LayerNorm(dim)
-        self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, FEATURE_DIM))
+        width = config.trunk_dim
+        self.trunk_in = nn.Identity() if dim == width else nn.Linear(dim, width)
+        self.trunk = nn.ModuleList(Block(width, config.trunk_heads) for _ in range(config.trunk_layers))
+        self.trunk_norm = nn.LayerNorm(width)
+        self.head = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, FEATURE_DIM))
 
         for name in ('input_mean', 'input_std', 'action_mean', 'action_std'):
             value = torch.tensor(stats[name]) if stats else torch.full((FEATURE_DIM,), float(name.endswith('std')))
             self.register_buffer(name, value.float())
 
+    def _reader_groups(self, seg_kind, seg_sample):
+        """Group segments by kind and actual query count, splitting each sample's reference budget."""
+        budget = self.config.num_latents
+        groups, references = defaultdict(list), defaultdict(list)
+        for index, (kind, sample) in enumerate(zip(seg_kind.tolist(), seg_sample.tolist(), strict=True)):
+            if kind == REFERENCE and self.config.share_reference_budget:
+                references[sample].append(index)
+            else:
+                groups[kind, budget].append(index)
+        for indices in references.values():
+            count, extra = divmod(budget, len(indices))
+            if count == 0:
+                raise ValueError(f'{len(indices)} references exceed the shared budget of {budget} latents')
+            for rank, index in enumerate(indices):
+                groups[REFERENCE, count + (rank < extra)].append(index)
+        return groups
+
     def encode(self, batch):
-        """Segments of a collated batch -> latents [segments, L, dim]."""
+        """One [query count, dim] tensor per segment, in input order. Legacy checkpoints return a stack."""
         kind = batch['seg_kind']
         tokens, group = [], []
-        if 'images' in batch:
-            image = self.patch(batch['images'].float() / 127.5 - 1).flatten(2).transpose(1, 2)
-            fact = self.offset(batch['img_off']) + self.camera(batch['img_cam']) + self.modality.weight[0]
-            tokens.append((image + self.patch_position + fact[:, None]).flatten(0, 1))
-            group.append(batch['img_seg'].repeat_interleave(image.shape[1]))
+        base_grid = tuple(size // self.config.patch for size in self.config.image_size)
+        for views in batch['image_groups']:
+            image = self.patch(views['pixels'].float() / 127.5 - 1)
+            position = self.patch_position
+            if image.shape[-2:] != base_grid:
+                grid = position.T.reshape(1, self.config.dim, *base_grid)
+                position = F.interpolate(grid, size=image.shape[-2:], mode='bicubic',
+                                         align_corners=False).flatten(2)[0].T
+            image = image.flatten(2).transpose(1, 2)
+            fact = self.offset(views['off']) + self.camera(views['cam']) + self.modality.weight[0]
+            tokens.append((image + position + fact[:, None]).flatten(0, 1))
+            group.append(views['seg'].repeat_interleave(image.shape[1]))
         state = (batch['state'] - self.input_mean) / self.input_std
         tokens.append(self.state(state) + self.offset(batch['st_off']) + self.modality.weight[1])
         group.append(batch['st_seg'])
@@ -128,29 +157,35 @@ class LoomPolicy(nn.Module):
 
         # Read the segments of each kind as one padded batch: current segments are much shorter than
         # references, and padding them to reference length would waste most of the reader's memory.
-        latents, order = [], []
-        for value in kind.unique():
-            segments = (kind == value).nonzero()[:, 0]
-            renumber = torch.zeros_like(kind).index_put_((segments,), torch.arange(len(segments), device=kind.device))
-            chosen = kind[group] == value
-            padded, mask = pad_groups(tokens[chosen], renumber[group[chosen]], len(segments))
-            read = self.latents.expand(len(segments), -1, -1)
+        latents = [None] * len(kind)
+        for (_, count), indices in self._reader_groups(kind, batch['seg_sample']).items():
+            segments = kind.new_tensor(indices)
+            renumber = torch.full_like(kind, -1)
+            renumber[segments] = torch.arange(len(indices), device=kind.device)
+            local_group = renumber[group]
+            chosen = local_group >= 0
+            padded, mask = pad_groups(tokens[chosen], local_group[chosen], len(indices))
+            read = self.latents[:count].expand(len(indices), -1, -1)
             for cross, *layers in self.reader:
                 read = cross(read, padded, mask)
                 for layer in layers:
                     read = layer(read)
-            latents.append(read)
-            order.append(segments)
-        return self.reader_norm(torch.cat(latents)[torch.argsort(torch.cat(order))])
+            for index, result in zip(indices, self.reader_norm(read).unbind(), strict=True):
+                latents[index] = result
+        return tuple(latents) if self.config.share_reference_budget else torch.stack(latents)
 
     def decode(self, latents, seg_sample, seg_kind, samples):
         """Latents of all segments -> normalized actions [samples, horizon, 20]."""
         horizon = self.config.horizon
-        latents = latents + self.latent_position + self.latent_kind(seg_kind)[:, None]
-        latents, mask = pad_groups(latents, seg_sample, samples)
-        mask = mask.repeat_interleave(latents.shape[2], 1)
+        counts = seg_sample.new_tensor([len(segment) for segment in latents])
+        latents = torch.cat(tuple(latents))
+        segment = torch.repeat_interleave(torch.arange(len(counts), device=latents.device), counts,
+                                          output_size=len(latents))
+        position = torch.arange(len(latents), device=latents.device) - (counts.cumsum(0) - counts)[segment]
+        latents = latents + self.latent_position[position] + self.latent_kind(seg_kind)[segment]
+        latents, mask = pad_groups(latents, seg_sample[segment], samples)
         slots = self.slot + self.offset(torch.arange(1, horizon + 1, device=latents.device))
-        x = torch.cat((latents.flatten(1, 2), slots.expand(samples, -1, -1)), 1)
+        x = self.trunk_in(torch.cat((latents, slots.expand(samples, -1, -1)), 1))
         mask = torch.cat((mask, mask.new_ones(samples, horizon)), 1)
         for layer in self.trunk:
             x = layer(x, mask=mask)

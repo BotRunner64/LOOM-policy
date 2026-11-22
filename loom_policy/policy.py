@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 
-from loom_policy.data import CAMERAS, CURRENT, REFERENCE, collate, make_segment, resize
+from loom_policy.data import CAMERAS, CURRENT, REFERENCE, batch_to, collate, make_segment, resize
 from loom_policy.eval import load_model
 from loom_policy.geometry import compose, relative
 
@@ -17,20 +17,21 @@ class Policy:
     def segment(self, kind, states, images, cameras, instruction, previous=None):
         """Observed frames, obs_stride apart and oldest first, as a model segment.
 
-        states [F, 26] contract states, images [F, C, H, W, 3] uint8, cameras: C names
+        states [F, 26] contract states, images [F][C] of H x W x 3 uint8, cameras: C names
         from CAMERAS, previous: the state one obs_stride before states[0], if known.
         """
         states = np.asarray(states, dtype=np.float64)
         before = np.concatenate(([states[0] if previous is None else previous], states[:-1]))
         offsets = (np.arange(len(states)) - len(states) + 1) * self.config.obs_stride
-        images = np.stack([[resize(view, self.config.image_size) for view in frame] for frame in images])
+        patch = self.config.patch if self.config.adaptive_rgb else None
+        images = [[resize(view, self.config.image_size, patch) for view in frame] for frame in images]
         return make_segment(kind, relative(before, states), offsets, [(offsets[0], instruction)], images,
                             [CAMERAS.index(name) for name in cameras], self.config.max_text_bytes)
 
     @torch.no_grad()
     def encode(self, segments):
         batch = collate([{'segments': segments}])
-        batch = {key: value.to(self.device) for key, value in batch.items()}
+        batch = batch_to(batch, self.device)
         with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
             return self.model.encode(batch)
 
@@ -45,7 +46,7 @@ class Policy:
         latents = self.encode([self.segment(CURRENT, states, images, cameras, instruction, previous)])
         kinds = [CURRENT]
         if self.references is not None:
-            latents = torch.cat((latents, self.references))
+            latents = (*latents, *self.references)
             kinds += [REFERENCE] * len(self.references)
         kinds = torch.tensor(kinds, device=self.device)
         with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):

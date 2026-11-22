@@ -1,4 +1,4 @@
-"""A small synthetic export-contract dataset: 5 episodes, three 64x48 cameras."""
+"""A small synthetic export-contract dataset with landscape, portrait and square cameras."""
 import json
 
 import av
@@ -10,6 +10,7 @@ import pytest
 from loom_policy.config import Config
 
 CAMERAS = ('top', 'left_wrist', 'right_wrist')
+CAMERA_SIZES = ((48, 64), (64, 48), (32, 32))
 
 
 def color(frame, camera):
@@ -65,9 +66,10 @@ def dataset(tmp_path_factory):
             path.parent.mkdir(parents=True, exist_ok=True)
             with av.open(str(path), 'w') as container:
                 stream = container.add_stream('libx264', rate=30, options={'g': '2', 'crf': '10'})
-                stream.width, stream.height, stream.pix_fmt = 64, 48, 'yuv420p'
+                h, w = CAMERA_SIZES[number]
+                stream.width, stream.height, stream.pix_fmt = w, h, 'yuv420p'
                 for k in range(length):
-                    image = np.full((48, 64, 3), color(k, number), dtype=np.uint8)
+                    image = np.full((h, w, 3), color(k, number), dtype=np.uint8)
                     container.mux(stream.encode(av.VideoFrame.from_ndarray(image, format='rgb24')))
                 container.mux(stream.encode())
             row.update({f'videos/{key}/chunk_index': 0, f'videos/{key}/file_index': episode,
@@ -82,7 +84,8 @@ def dataset(tmp_path_factory):
     pq.write_table(pa.Table.from_pylist(episodes), root / 'meta/episodes/chunk-000/file-000.parquet')
     pq.write_table(pa.table({'task_index': [0, 1], 'task': ['pick the cup', '把杯子放下']}), root / 'meta/tasks.parquet')
     features = {'observation.state': {'dtype': 'float32', 'shape': [26]},
-                **{f'observation.images.{camera}': {'dtype': 'video', 'shape': [48, 64, 3]} for camera in CAMERAS}}
+                **{f'observation.images.{camera}': {'dtype': 'video', 'shape': [*size, 3]}
+                   for camera, size in zip(CAMERAS, CAMERA_SIZES)}}
     (root / 'meta/info.json').write_text(json.dumps({
         'codebase_version': 'v3.0', 'fps': 30, 'features': features,
         'data_path': 'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet',

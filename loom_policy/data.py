@@ -6,8 +6,9 @@ segments (windows of other episodes of the same dataset) and the action target
 instruction text; every token carries its frame offset from the segment anchor,
 which is the last frame of the segment.
 """
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import json
+import math
 from pathlib import Path
 import zlib
 
@@ -37,14 +38,32 @@ def find_datasets(paths):
     return roots
 
 
-def resize(image, size):
-    """HxWx3 uint8 -> size (H, W), the same swscale path the video reader uses."""
-    return av.VideoFrame.from_ndarray(np.ascontiguousarray(image), format='rgb24').to_ndarray(
-        width=size[1], height=size[0], format='rgb24')
+def rgb_size(height, width, size, patch):
+    """Choose a patch-aligned H x W, retaining native scale up to the configured area."""
+    if patch is None:
+        return size
+    max_pixels = math.prod(size)
+    budget = max_pixels // patch**2
+    scale = min(1., math.sqrt(max_pixels / (height * width))) / patch
+    rows, cols = max(1, round(height * scale)), max(1, round(width * scale))
+    if rows * cols > budget:
+        # Floor after scaling when rounding up would exceed the token budget.
+        # Clamping each axis also covers panoramas with a one-patch short side.
+        rows = min(budget, max(1, math.floor(height * scale)))
+        cols = min(budget, max(1, math.floor(width * scale)))
+    return rows * patch, cols * patch
 
 
-def read_frames(path, indices, size):
-    """Frames `indices` of a 30 fps video as [N, H, W, 3] uint8, resized to size (H, W)."""
+def resize(image, size, patch=None):
+    """Resize a decoded frame or a deployment RGB array with the same swscale operation."""
+    if not isinstance(image, av.VideoFrame):
+        image = av.VideoFrame.from_ndarray(np.ascontiguousarray(image), format='rgb24')
+    height, width = rgb_size(image.height, image.width, size, patch)
+    return image.to_ndarray(width=width, height=height, format='rgb24')
+
+
+def read_frames(path, indices, size, patch=None):
+    """Selected frames of a single camera as [N, H, W, 3] uint8."""
     frames = []
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
@@ -53,7 +72,7 @@ def read_frames(path, indices, size):
             container.seek(pts, stream=stream)
             for frame in container.decode(stream):
                 if frame.pts >= pts - 0.5 / FPS / stream.time_base:
-                    frames.append(frame.to_ndarray(width=size[1], height=size[0], format='rgb24'))
+                    frames.append(resize(frame, size, patch))
                     break
             else:
                 raise ValueError(f'{path}: no frame {index}')
@@ -105,8 +124,8 @@ class Source:
         self.cache.move_to_end(episode)
         return self.cache[episode]
 
-    def images(self, episode, indices, size):
-        """[N, cameras, H, W, 3] uint8."""
+    def images(self, episode, indices, size, patch=None):
+        """RGB views in frame, camera order. Adaptive views can have different shapes."""
         row = self.episodes[episode]
         views = []
         for camera in self.cameras:
@@ -115,7 +134,9 @@ class Source:
                 video_key=key, chunk_index=row[f'videos/{key}/chunk_index'],
                 file_index=row[f'videos/{key}/file_index'])
             start = round(row[f'videos/{key}/from_timestamp'] * FPS)
-            views.append(read_frames(path, [start + i for i in indices], size))
+            views.append(read_frames(path, [start + i for i in indices], size, patch))
+        if patch is not None:
+            return list(zip(*views, strict=True))
         return np.stack(views, axis=1)
 
 
@@ -123,7 +144,7 @@ def make_segment(kind, features, offsets, texts, images=None, cameras=(), max_te
     """One segment as tensors.
 
     features [F, 20] state features, offsets [F] frame offsets from the anchor,
-    texts [(offset, instruction)], images [F, C, H, W, 3] uint8 or None, cameras [C] ids.
+    texts [(offset, instruction)], images [F][C] of H x W x 3 uint8 or None, cameras [C] ids.
     """
     encoded = []
     for offset, text in texts:
@@ -134,25 +155,24 @@ def make_segment(kind, features, offsets, texts, images=None, cameras=(), max_te
     segment = {'kind': kind, 'state': torch.as_tensor(np.asarray(features, dtype=np.float32)),
                'offsets': torch.as_tensor(np.asarray(offsets, dtype=np.float32)), 'texts': encoded}
     if images is not None:
-        segment['images'] = torch.as_tensor(images).permute(0, 1, 4, 2, 3)
-        segment['cameras'] = torch.as_tensor(list(cameras))
+        segment['images'] = [[torch.as_tensor(view).permute(2, 0, 1) for view in frame] for frame in images]
+        segment['cameras'] = list(cameras)
     return segment
 
 
 def collate(samples):
     """Flatten samples into token groups; every token names its segment, every segment its sample."""
-    parts = {key: [] for key in ('images', 'img_seg', 'img_off', 'img_cam', 'state', 'st_seg', 'st_off',
+    image_groups = defaultdict(list)
+    parts = {key: [] for key in ('state', 'st_seg', 'st_off',
                                  'text', 'txt_seg', 'txt_off', 'txt_pos', 'seg_sample', 'seg_kind')}
     index = 0
     for number, sample in enumerate(samples):
         for segment in sample['segments']:
             count = len(segment['state'])
             if 'images' in segment:
-                cameras = segment['images'].shape[1]
-                parts['images'].append(segment['images'].flatten(0, 1))
-                parts['img_seg'].append(torch.full((count * cameras,), index))
-                parts['img_off'].append(segment['offsets'].repeat_interleave(cameras))
-                parts['img_cam'].append(segment['cameras'].repeat(count))
+                for frame, offset in zip(segment['images'], segment['offsets'].tolist(), strict=True):
+                    for image, camera in zip(frame, segment['cameras'], strict=True):
+                        image_groups[image.shape].append((image, index, offset, camera))
             parts['state'].append(segment['state'])
             parts['st_seg'].append(torch.full((count,), index))
             parts['st_off'].append(segment['offsets'])
@@ -165,9 +185,22 @@ def collate(samples):
             parts['seg_kind'].append(torch.tensor([segment['kind']]))
             index += 1
     batch = {key: torch.cat(value) for key, value in parts.items() if value}
+    batch['image_groups'] = []
+    for views in image_groups.values():
+        pixels, segments, offsets, cameras = zip(*views)
+        batch['image_groups'].append({'pixels': torch.stack(pixels), 'seg': torch.tensor(segments),
+                                      'off': torch.tensor(offsets), 'cam': torch.tensor(cameras)})
     if 'target' in samples[0]:
         batch['target'] = torch.stack([sample['target'] for sample in samples])
     return batch
+
+
+def batch_to(batch, device):
+    """Move collated tensors and resolution-grouped views to the model device."""
+    moved = {k: v.to(device, non_blocking=True) for k, v in batch.items() if k != 'image_groups'}
+    moved['image_groups'] = [
+        {k: v.to(device, non_blocking=True) for k, v in group.items()} for group in batch['image_groups']]
+    return moved
 
 
 class Samples(torch.utils.data.IterableDataset):
@@ -206,7 +239,8 @@ class Samples(torch.utils.data.IterableDataset):
         features = relative(states[np.maximum(frames - config.obs_stride, 0)], states[frames])
         changes = [i for i in range(len(frames)) if i == 0 or tasks[frames[i]] != tasks[frames[i - 1]]]
         texts = [(frames[i] - end, source.tasks[int(tasks[frames[i]])]) for i in changes]
-        images = source.images(episode, frames.tolist(), config.image_size) if self.with_images else None
+        patch = config.patch if config.adaptive_rgb else None
+        images = source.images(episode, frames.tolist(), config.image_size, patch) if self.with_images else None
         return make_segment(kind, features, frames - end, texts, images, source.cameras, config.max_text_bytes)
 
     def sample(self, rng):

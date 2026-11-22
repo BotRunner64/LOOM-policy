@@ -6,7 +6,8 @@ import json
 @dataclass
 class Config:
     # Segments. All counts are in 30 fps frames.
-    image_size: tuple = (192, 256)   # H, W every camera is resized to
+    image_size: tuple = (192, 256)   # base position grid (pixels); its area bounds each adaptive view
+    adaptive_rgb: bool = True
     obs_stride: int = 10             # observation subsampling step (open question in the design)
     current_frames: int = 2          # observed frames of the current segment, ending at t
     ref_frames: int = 32             # observed frames of one reference segment, at most
@@ -18,10 +19,13 @@ class Config:
     patch: int = 16
     dim: int = 512
     heads: int = 8
-    num_latents: int = 64            # L, latents per segment (open question in the design)
+    num_latents: int = 256           # one budget for current, another for all references together
+    share_reference_budget: bool = True
     reader_blocks: int = 2           # each: one cross-attention + reader_self_layers self-attention
     reader_self_layers: int = 2
     trunk_layers: int = 8
+    trunk_dim: int | None = None     # defaults to the reader width
+    trunk_heads: int | None = None   # defaults to the reader head count
 
     # Training.
     batch_size: int = 32
@@ -41,8 +45,22 @@ class Config:
 
     def __post_init__(self):
         self.image_size = tuple(self.image_size)
-        if any(size % self.patch for size in self.image_size) or self.dim % self.heads:
+        if self.trunk_dim is None:
+            self.trunk_dim = self.dim
+        if self.trunk_heads is None:
+            self.trunk_heads = self.heads
+        if self.trunk_dim < 1 or self.trunk_heads < 1 or self.trunk_dim % self.trunk_heads:
+            raise ValueError('trunk_dim must be positive and divisible by a positive trunk_heads')
+        if self.num_latents < 1 or (self.share_reference_budget and self.max_refs > self.num_latents):
+            raise ValueError('num_latents must be positive and cover at least one latent per sampled reference')
+        if (len(self.image_size) != 2 or self.patch < 1 or any(size < 1 or size % self.patch for size in self.image_size)
+                or self.dim % self.heads):
             raise ValueError('image_size must be a multiple of patch, dim a multiple of heads')
+
+    @classmethod
+    def from_checkpoint(cls, values):
+        # Runs saved before adaptive RGB used fixed H x W for every camera.
+        return cls(**{'adaptive_rgb': False, 'num_latents': 64, 'share_reference_budget': False, **values})
 
     @classmethod
     def load(cls, path=None, overrides=()):

@@ -40,14 +40,35 @@ def test_train_resume_evaluate_and_act(dataset, tmp_path):
     policy = Policy(tmp_path / 'last.pt', 'cpu')
     source = Source(dataset)
     states, _ = source.frames(1)
-    images = source.images(1, [20, 23], (48, 64))
+    images = source.images(1, [20, 23], (64, 64), patch=1)
     cameras = ['top', 'left_wrist', 'right_wrist']
+    live = policy.segment(0, states[[20, 23]], images, cameras, 'pick the cup', previous=states[17])
+    offline = Samples([dataset], model.config).segment(0, 0, 1, 23, 2)
+    assert [[v.shape for v in frame] for frame in live['images']] == [
+        [v.shape for v in frame] for frame in offline['images']]
     without = policy.act(states[[20, 23]], images, cameras, 'pick the cup', previous=states[17])
     assert without.shape == (8, 26)
     rotation = without[:, 3:12].reshape(8, 3, 3)
     np.testing.assert_allclose(rotation @ rotation.transpose(0, 2, 1), np.tile(np.eye(3), (8, 1, 1)), atol=1e-5)
     reference_states, _ = source.frames(2)
     frames = list(range(0, 15, 3))
-    policy.set_references([{'states': reference_states[frames], 'images': source.images(2, frames, (48, 64)),
+    policy.set_references([{'states': reference_states[frames], 'images': source.images(2, frames, (64, 64), patch=1),
                             'cameras': cameras, 'instruction': 'pick the cup'}])
     assert np.abs(policy.act(states[[20, 23]], images, cameras, 'pick the cup', previous=states[17]) - without).max() > 0
+
+    # The same raw views use the historical fixed-size processor for an old checkpoint.
+    del first['config']['adaptive_rgb']
+    del first['config']['share_reference_budget']
+    del first['config']['trunk_dim']
+    del first['config']['trunk_heads']
+    torch.save(first, tmp_path / 'legacy.pt')
+    legacy = Policy(tmp_path / 'legacy.pt', 'cpu')
+    segment = legacy.segment(0, states[[20, 23]], images, cameras, 'pick the cup')
+    assert all(view.shape == (3, 32, 48) for frame in segment['images'] for view in frame)
+    reference = {'states': reference_states[frames], 'images': source.images(2, frames, (48, 64)),
+                 'cameras': cameras, 'instruction': 'pick the cup'}
+    legacy.set_references([reference, reference])
+    assert legacy.references.shape == (2, 4, 32)
+    policy.set_references([reference, reference])
+    assert [len(x) for x in policy.references] == [2, 2]
+    assert policy.act(states[[20, 23]], images, cameras, 'pick the cup').shape == (8, 26)

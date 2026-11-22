@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import numpy as np
 import torch
 
+from loom_policy.config import Config
 from loom_policy.data import Samples, collate
 from loom_policy.model import LoomPolicy, pad_groups
 
@@ -24,6 +27,7 @@ def make(dataset, config, refs):
 
 
 def test_forward_and_backward(dataset, config):
+    config.trunk_dim, config.trunk_heads = 64, 4
     model, drawn = make(dataset, config, [0, 2, 1])
     loss, actions = model(collate(drawn))
     assert actions.shape == (3, 8, 20) and loss.item() > 0
@@ -40,6 +44,7 @@ def test_a_sample_does_not_depend_on_its_batch(dataset, config):
 
 
 def test_reference_changes_the_prediction_and_can_be_encoded_once(dataset, config):
+    config.trunk_dim, config.trunk_heads = 64, 4
     model, (sample,) = make(dataset, config, [2])
     current, references = sample['segments'][:1], sample['segments'][1:]
     with torch.no_grad():
@@ -48,7 +53,34 @@ def test_reference_changes_the_prediction_and_can_be_encoded_once(dataset, confi
         assert (full - alone).abs().max() > 1e-4
         # Latents of the references are computed without the current segment and reused.
         cached = model.encode(collate([{'segments': references}]))
-        latents = torch.cat((model.encode(collate([{'segments': current}])), cached))
+        latents = (*model.encode(collate([{'segments': current}])), *cached)
         kinds = torch.tensor([0, 1, 1])
         split = model.decode(latents, torch.zeros(3, dtype=torch.long), kinds, 1)
         torch.testing.assert_close(split * model.action_std + model.action_mean, full, atol=1e-5, rtol=1e-4)
+
+
+def test_current_and_all_references_each_get_one_budget(dataset, config):
+    config.num_latents = Config().num_latents
+    model, drawn = make(dataset, config, [0, 1, 2, 3])
+    batch = collate(drawn)
+    with torch.no_grad():
+        latents = model.encode(batch)
+        assert [len(x) for x in latents] == [256, 256, 256, 256, 128, 128, 256, 86, 85, 85]
+        trunk_masks = []
+        hook = model.trunk[0].register_forward_pre_hook(
+            lambda module, args, kwargs: trunk_masks.append(kwargs['mask']), with_kwargs=True)
+        model.decode(latents, batch['seg_sample'], batch['seg_kind'], len(drawn))
+        hook.remove()
+    mask, = trunk_masks
+    assert mask.shape == (4, 512 + config.horizon)
+    assert mask.sum(dim=1).tolist() == [n + config.horizon for n in (256, 512, 512, 512)]
+
+
+def test_2b_preset():
+    config = Config.load(Path(__file__).resolve().parents[1] / 'configs/2b.json')
+    with torch.device('meta'):
+        model = LoomPolicy(config)
+    assert model.latents.shape == (256, 512)
+    assert model.trunk_in.weight.shape == (2560, 512)
+    assert len(model.trunk) == 25 and all(layer.heads == 40 for layer in model.trunk)
+    assert sum(p.numel() for p in model.parameters()) == 1_995_083_796

@@ -6,14 +6,14 @@ import numpy as np
 import torch
 
 from loom_policy.config import Config
-from loom_policy.data import Samples, collate, find_datasets
+from loom_policy.data import Samples, batch_to, collate, find_datasets
 from loom_policy.geometry import errors
 from loom_policy.model import LoomPolicy
 
 
 def load_model(checkpoint, device):
     state = torch.load(checkpoint, map_location='cpu', weights_only=True)
-    model = LoomPolicy(Config(**state['config']))
+    model = LoomPolicy(Config.from_checkpoint(state['config']))
     model.load_state_dict(state['model'])
     return model.to(device).eval()
 
@@ -26,7 +26,7 @@ def evaluate(model, samples, batches, batch_size, device):
     totals = {}
     for _ in range(batches):
         batch = collate([samples.sample(rng) for _ in range(batch_size)])
-        batch = {key: value.to(device) for key, value in batch.items()}
+        batch = batch_to(batch, device)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
             loss, actions = model(batch)
         metrics = {'loss': loss.item(), **errors(actions.cpu().numpy(), batch['target'].cpu().numpy())}

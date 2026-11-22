@@ -3,7 +3,7 @@
   "current_frames": 2,
   "ref_frames": 32,
   "max_refs": 2,
-  "num_latents": 64,
+  "num_latents": 256,
   "dim": 512,
   "heads": 8,
   "reader_blocks": 2,
