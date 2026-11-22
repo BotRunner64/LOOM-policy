@@ -21,11 +21,14 @@ class Policy:
         from CAMERAS, previous: the state one obs_stride before states[0], if known.
         """
         states = np.asarray(states, dtype=np.float64)
-        before = np.concatenate(([states[0] if previous is None else previous], states[:-1]))
+        features = states
+        if not self.config.absolute_state:
+            before = np.concatenate(([states[0] if previous is None else previous], states[:-1]))
+            features = relative(before, states)
         offsets = (np.arange(len(states)) - len(states) + 1) * self.config.obs_stride
         patch = self.config.patch if self.config.adaptive_rgb else None
         images = [[resize(view, self.config.image_size, patch) for view in frame] for frame in images]
-        return make_segment(kind, relative(before, states), offsets, [(offsets[0], instruction)], images,
+        return make_segment(kind, features, offsets, [(offsets[0], instruction)], images,
                             [CAMERAS.index(name) for name in cameras], self.config.max_text_bytes)
 
     @torch.no_grad()

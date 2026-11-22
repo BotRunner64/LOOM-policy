@@ -1,14 +1,54 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from loom_policy import train
+from loom_policy.config import Config
 from loom_policy.eval import evaluate, load_model
-from loom_policy.data import Samples
+from loom_policy.data import CURRENT, Samples, collate, statistics
 from loom_policy.policy import Policy
 from loom_policy.data import Source
 from loom_policy.geometry import relative
+from loom_policy.model import LoomPolicy
+
+
+def test_rebot_single_absolute_state(dataset, tmp_path):
+    preset = Path(__file__).resolve().parents[1] / 'configs/rebot_observation.json'
+    config = Config.load(preset, ['dim=32', 'trunk_dim=32', 'trunk_heads=2', 'trunk_layers=1',
+                                 'num_latents=4', 'val_fraction=0', 'stats_samples=8'])
+    samples = Samples([dataset], config)
+    sample = samples.sample(np.random.default_rng(0))
+    segment, = sample['segments']
+    assert segment['kind'] == CURRENT and segment['state'].shape == (1, 26)
+    assert len(segment['images']) == 1 and len(segment['images'][0]) == 3
+    # Identify the anchor by its recorded absolute state and check all future actions against it.
+    for _, episode, _ in samples.episodes:
+        states, _ = samples.sources[0].frames(episode)
+        matches = np.flatnonzero((states == segment['state'].numpy()).all(axis=1))
+        if matches.size:
+            t = matches.item()
+            break
+    else:
+        raise AssertionError('absolute state does not match a recorded frame')
+    np.testing.assert_allclose(sample['target'], relative(states[t], states[t+1:t+51]))
+
+    model = LoomPolicy(config, statistics([dataset], config))
+    assert model.input_std.shape == (26,) and model.action_std.shape == (20,)
+    loss, actions = model(collate([sample]))
+    loss.backward()
+    assert torch.isfinite(loss) and actions.shape == (1, 50, 20)
+    checkpoint = tmp_path / 'absolute.pt'
+    torch.save({'model': model.state_dict(), 'config': config.to_dict()}, checkpoint)
+    policy = Policy(checkpoint, 'cpu')
+    images = samples.sources[0].images(episode, [t], config.image_size, config.patch)
+    args = (states[t:t+1], images, ['top', 'left_wrist', 'right_wrist'], 'pick the cup')
+    torch.testing.assert_close(policy.segment(CURRENT, *args)['state'], segment['state'])
+    prefix = states[t+1:t+4]
+    chunk = policy.act(*args, prefix_states=prefix)
+    assert chunk.shape == (50, 26) and np.isfinite(chunk).all()
+    np.testing.assert_array_equal(chunk[:3], prefix)
 
 
 def run(dataset, directory, steps):

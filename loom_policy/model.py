@@ -21,7 +21,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from loom_policy.data import REFERENCE
-from loom_policy.geometry import FEATURE_DIM
+from loom_policy.geometry import FEATURE_DIM, STATE_DIM
 
 
 def pad_groups(values, group, count):
@@ -85,7 +85,8 @@ class LoomPolicy(nn.Module):
         # Tokens.
         self.patch = nn.Conv2d(3, dim, config.patch, config.patch)
         self.patch_position = parameter(patches, dim)
-        self.state = nn.Sequential(nn.Linear(FEATURE_DIM, dim), nn.GELU(), nn.Linear(dim, dim))
+        input_dim = STATE_DIM if config.absolute_state else FEATURE_DIM
+        self.state = nn.Sequential(nn.Linear(input_dim, dim), nn.GELU(), nn.Linear(dim, dim))
         self.byte = nn.Embedding(256, dim)
         self.byte_position = nn.Embedding(config.max_text_bytes, dim)
         self.offset = FrameOffset(dim)
@@ -109,9 +110,11 @@ class LoomPolicy(nn.Module):
         self.trunk_norm = nn.LayerNorm(width)
         self.head = nn.Sequential(nn.Linear(width, width), nn.GELU(), nn.Linear(width, FEATURE_DIM))
 
-        for name in ('input_mean', 'input_std', 'action_mean', 'action_std'):
-            value = torch.tensor(stats[name]) if stats else torch.full((FEATURE_DIM,), float(name.endswith('std')))
-            self.register_buffer(name, value.float())
+        for group, size in (('input', input_dim), ('action', FEATURE_DIM)):
+            for suffix, default in (('mean', 0.), ('std', 1.)):
+                name = f'{group}_{suffix}'
+                value = torch.tensor(stats[name]) if stats else torch.full((size,), default)
+                self.register_buffer(name, value.float())
 
     def _reader_groups(self, seg_kind, seg_sample):
         """Group segments by kind and actual query count, splitting each sample's reference budget."""

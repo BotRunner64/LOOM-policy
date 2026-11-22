@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
-from loom_policy.geometry import FEATURE_DIM, STATE_DIM, relative
+from loom_policy.geometry import STATE_DIM, relative
 
 FPS = 30
 STATE_KEY = 'observation.state'
@@ -143,7 +143,7 @@ class Source:
 def make_segment(kind, features, offsets, texts, images=None, cameras=(), max_text_bytes=256):
     """One segment as tensors.
 
-    features [F, 20] state features, offsets [F] frame offsets from the anchor,
+    features [F, D] absolute states or relative state features, offsets [F] frame offsets from the anchor,
     texts [(offset, instruction)], images [F][C] of H x W x 3 uint8 or None, cameras [C] ids.
     """
     encoded = []
@@ -235,8 +235,9 @@ class Samples(torch.utils.data.IterableDataset):
         states, tasks = source.frames(episode)
         frames = np.arange(end - (count - 1) * config.obs_stride, end + 1, config.obs_stride)
         frames = frames[frames >= 0]
-        # Step-wise relative state: each observed frame against the previous observed frame.
-        features = relative(states[np.maximum(frames - config.obs_stride, 0)], states[frames])
+        features = states[frames]
+        if not config.absolute_state:
+            features = relative(states[np.maximum(frames - config.obs_stride, 0)], features)
         changes = [i for i in range(len(frames)) if i == 0 or tasks[frames[i]] != tasks[frames[i - 1]]]
         texts = [(frames[i] - end, source.tasks[int(tasks[frames[i]])]) for i in changes]
         patch = config.patch if config.adaptive_rgb else None
@@ -284,7 +285,7 @@ def statistics(roots, config):
         targets.append(sample['target'])
     result = {}
     for name, values in (('input', inputs), ('action', targets)):
-        values = torch.cat(values).double().reshape(-1, FEATURE_DIM)
+        values = torch.cat(values).double()
         result[f'{name}_mean'] = values.mean(0).tolist()
         result[f'{name}_std'] = values.std(0).clamp_min(1e-3).tolist()
     return result

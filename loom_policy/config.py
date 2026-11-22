@@ -10,6 +10,7 @@ class Config:
     adaptive_rgb: bool = True
     obs_stride: int = 10             # observation subsampling step (open question in the design)
     current_frames: int = 2          # observed frames of the current segment, ending at t
+    absolute_state: bool = False     # encode the observed 26D contract state at each frame
     ref_frames: int = 32             # observed frames of one reference segment, at most
     max_refs: int = 2                # training draws 0..max_refs reference segments per sample
     horizon: int = 50                # action slots: frames t+1 .. t+horizon
@@ -33,6 +34,7 @@ class Config:
     steps: int = 100_000
     lr: float = 3e-4
     weight_decay: float = 0.05
+    adam_beta2: float = 0.999
     warmup: int = 1000
     grad_clip: float = 1.0
     workers: int = 8
