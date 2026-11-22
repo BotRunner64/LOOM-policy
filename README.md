@@ -3,7 +3,7 @@
 多 domain co-train 的统一策略：部署时参数冻结，只靠参考 segment 适配。设计见 Notion「LOOM / policy」页，数据只读 [LOOM-data 导出契约](https://github.com/BotRunner64/LOOM-data/blob/main/docs/contract/export-contract.md)。
 
 1. 当前和参考 segment 共用一个 reader（Perceiver IO）。默认当前段输出 256 个 latent；同一样本的所有参考段合计输出 256 个。一段参考用 256 个，两段各用 128 个，无法整除时排在前面的参考各多用一个。
-2. 所有 latent + 50 个动作槽 → 共享 transformer。
+2. 512 维 Reader 输出与 50 个动作槽拼接后，线性投影到 2560 维，进入 25 层、40 头的 Transformer 主干。整网共 1,995,083,796 个可训练参数。
 3. 动作槽直接回归未来 50 帧，L1。
 
 没有参考时主干接收 306 个 token，有参考时接收 562 个。`num_latents` 同时设置当前段和全部参考的预算。旧 checkpoint 续训和推理沿用原来的逐段预算。
@@ -13,27 +13,22 @@
 ## 环境
 
 ```bash
-conda create -n loom-policy --override-channels -c conda-forge python=3.11 pip
-```
-
-```bash
-conda activate loom-policy && pip install -e ".[dev]" && pytest
+conda env create -f environment.yml
+conda activate loom-policy && pytest
 ```
 
 ## 使用
 
-训练。`--data` 可以是数据集目录、源目录或导出根目录；`--output` 下已有 `last.pt` 时自动续训：
+新训练默认使用 LOOM 2B。`--data` 可以是数据集目录、源目录或导出根目录。如果输出目录已有 `last.pt`，会按 checkpoint 中的配置续训。
 
 ```bash
-loom-train --data <数据目录>... --output runs/<name> --config configs/base.json
+loom-train --data <数据目录>... --output runs/<name>
 ```
-
-2B 版本使用 `--config configs/2b.json` 和独立的输出目录，例如 `runs/loom-2b`。Reader 宽度为 512，当前段和全部参考各占 256 个 latent。拼接动作槽后，一层线性投影将宽度升到 2560，再进入 25 层、40 个头的主干。训练、评估和部署都从 checkpoint 恢复对应的模型尺寸。
 
 多卡：
 
 ```bash
-torchrun --nproc_per_node 8 -m loom_policy.train --data <数据目录>... --output runs/<name> --config configs/base.json
+torchrun --nproc_per_node 8 -m loom_policy.train --data <数据目录>... --output runs/<name>
 ```
 
 离线评估，同一个模型只换参考数量：

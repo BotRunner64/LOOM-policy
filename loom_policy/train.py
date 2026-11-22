@@ -71,9 +71,9 @@ def main(argv=None):
         optimizer.step()
         scheduler.step()
         step += 1
-        window += loss.item() / config.log_every
         if rank:
             continue
+        window += loss.item() / config.log_every
         record = {}
         if step % config.log_every == 0:
             record = {'loss': window, 'lr': scheduler.get_last_lr()[0],

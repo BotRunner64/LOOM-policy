@@ -26,10 +26,11 @@ def evaluate(model, samples, batches, batch_size, device):
     totals = {}
     for _ in range(batches):
         batch = collate([samples.sample(rng) for _ in range(batch_size)])
+        target = batch['target'].numpy()
         batch = batch_to(batch, device)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
             loss, actions = model(batch)
-        metrics = {'loss': loss.item(), **errors(actions.cpu().numpy(), batch['target'].cpu().numpy())}
+        metrics = {'loss': loss.item(), **errors(actions.cpu().numpy(), target)}
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.) + value / batches
     model.train()

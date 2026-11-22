@@ -27,7 +27,6 @@ def make(dataset, config, refs):
 
 
 def test_forward_and_backward(dataset, config):
-    config.trunk_dim, config.trunk_heads = 64, 4
     model, drawn = make(dataset, config, [0, 2, 1])
     loss, actions = model(collate(drawn))
     assert actions.shape == (3, 8, 20) and loss.item() > 0
@@ -44,7 +43,6 @@ def test_a_sample_does_not_depend_on_its_batch(dataset, config):
 
 
 def test_reference_changes_the_prediction_and_can_be_encoded_once(dataset, config):
-    config.trunk_dim, config.trunk_heads = 64, 4
     model, (sample,) = make(dataset, config, [2])
     current, references = sample['segments'][:1], sample['segments'][1:]
     with torch.no_grad():
@@ -76,8 +74,9 @@ def test_current_and_all_references_each_get_one_budget(dataset, config):
     assert mask.sum(dim=1).tolist() == [n + config.horizon for n in (256, 512, 512, 512)]
 
 
-def test_2b_preset():
-    config = Config.load(Path(__file__).resolve().parents[1] / 'configs/2b.json')
+def test_default_model_is_2b():
+    config = Config.load()
+    assert config == Config.load(Path(__file__).resolve().parents[1] / 'configs/2b.json')
     with torch.device('meta'):
         model = LoomPolicy(config)
     assert model.latents.shape == (256, 512)

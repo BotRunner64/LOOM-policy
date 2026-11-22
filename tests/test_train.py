@@ -12,7 +12,8 @@ from loom_policy.data import Source
 
 def run(dataset, directory, steps):
     overrides = ['image_size=[32,48]', 'obs_stride=3', 'ref_frames=5', 'horizon=8', 'dim=32', 'heads=2',
-                 'num_latents=4', 'reader_blocks=1', 'reader_self_layers=1', 'trunk_layers=2', 'workers=0',
+                 'num_latents=4', 'reader_blocks=1', 'reader_self_layers=1',
+                 'trunk_dim=32', 'trunk_heads=2', 'trunk_layers=2', 'workers=0',
                  'batch_size=4', 'stats_samples=20', 'val_fraction=0.4', 'eval_batches=1', 'warmup=2',
                  f'steps={steps}', 'log_every=2', 'eval_every=4', 'save_every=4']
     train.main(['--data', str(dataset), '--output', str(directory), '--set', *overrides])

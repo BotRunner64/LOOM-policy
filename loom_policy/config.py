@@ -23,9 +23,9 @@ class Config:
     share_reference_budget: bool = True
     reader_blocks: int = 2           # each: one cross-attention + reader_self_layers self-attention
     reader_self_layers: int = 2
-    trunk_layers: int = 8
-    trunk_dim: int | None = None     # defaults to the reader width
-    trunk_heads: int | None = None   # defaults to the reader head count
+    trunk_layers: int = 25
+    trunk_dim: int | None = 2560
+    trunk_heads: int | None = 40
 
     # Training.
     batch_size: int = 32
@@ -59,8 +59,9 @@ class Config:
 
     @classmethod
     def from_checkpoint(cls, values):
-        # Runs saved before adaptive RGB used fixed H x W for every camera.
-        return cls(**{'adaptive_rgb': False, 'num_latents': 64, 'share_reference_budget': False, **values})
+        # Older checkpoints inherited the reader width and head count for the trunk.
+        return cls(**{'adaptive_rgb': False, 'num_latents': 64, 'share_reference_budget': False,
+                      'trunk_dim': None, 'trunk_heads': None, 'trunk_layers': 8, **values})
 
     @classmethod
     def load(cls, path=None, overrides=()):
