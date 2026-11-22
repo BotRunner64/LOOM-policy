@@ -1,5 +1,6 @@
 {
   "absolute_state": true,
+  "rebot_quantile_stats": "../openpi_rebot/data/packing_rtc_gop2_20261119_h50/rebot/norm_stats.json",
   "current_frames": 1,
   "max_refs": 0,
   "max_prefix_len": 6,

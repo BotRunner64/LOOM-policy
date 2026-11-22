@@ -41,7 +41,7 @@ loom-eval --checkpoint runs/<name>/last.pt --data <数据目录>... --refs 0 1 2
 
 ReBot 单帧无参考实验使用 `--config configs/rebot_observation.json`。每个样本读取当前三视角图像、任务指令和数据集坐标系下的双臂绝对状态（每臂 xyz、按列展开的旋转矩阵和夹爪开合度，共 26 维）。动作目标仍以当前位姿为基准，共 20 维，训练前缀长度为 0 到 6。状态和动作分别用各自的均值、标准差归一化。
 
-Packing 从头训练使用 `configs/rebot_packing_2b.json`，8 卡各 8 个样本，训练 20,000 步，全量 episode 参与训练。AdamW 峰值学习率为 1e-4，预热 1,000 步，余弦衰减，每 500 步保存一次。用同一输出目录重启会加载最新 checkpoint。
+Packing 从头训练使用 `configs/rebot_packing_2b.json`，8 卡各 8 个样本，训练 20,000 步，全量 episode 参与训练。该配置从相邻的 openpi_rebot 仓库读取本次 packing 数据的 P1/P99 统计文件，将状态和动作的位置与夹爪缩放到分位点对应的 −1 和 +1，保留超出分位点的值及旋转原值。部署和续训从 checkpoint 读取归一化参数。AdamW 峰值学习率为 1e-4，预热 1,000 步，余弦衰减，每 500 步保存一次。用同一输出目录重启会加载最新 checkpoint。
 
 ### 动作前缀
 

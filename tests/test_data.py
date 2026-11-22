@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 
@@ -84,3 +86,22 @@ def test_split_and_statistics(dataset, config):
         train.sample(np.random.default_rng(0))
     stats = statistics([dataset], config)
     assert all(len(stats[key]) == 20 for key in ('input_mean', 'input_std', 'action_mean', 'action_std'))
+
+
+def test_rebot_quantile_statistics(config, tmp_path):
+    config.absolute_state = True
+    config.rebot_quantile_stats = str(tmp_path / 'norm_stats.json')
+    source = {}
+    for key, dim in [('state', 26), ('actions', 20)]:
+        lo, hi = np.full(dim, 2.), np.full(dim, 10.)
+        for arm in (0, dim // 2):
+            rotation = slice(arm + 3, arm + dim // 2 - 1)
+            lo[rotation], hi[rotation] = -1, 1
+        source[key] = {'q01': lo.tolist(), 'q99': hi.tolist()}
+    (tmp_path / 'norm_stats.json').write_text(json.dumps({'norm_stats': source}))
+    stats = statistics([], config)
+    for group, dim in [('input', 26), ('action', 20)]:
+        center, scale = (np.asarray(stats[f'{group}_{suffix}']) for suffix in ('mean', 'std'))
+        assert center.shape == scale.shape == (dim,)
+        np.testing.assert_allclose((np.array([2, 6, 10, 14]) - center[0]) / scale[0], [-1, 0, 1, 2])
+        assert center[3] == 0 and scale[3] == 1

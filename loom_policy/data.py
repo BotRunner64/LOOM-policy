@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
-from loom_policy.geometry import STATE_DIM, relative
+from loom_policy.geometry import FEATURE_DIM, STATE_DIM, relative
 
 FPS = 30
 STATE_KEY = 'observation.state'
@@ -275,7 +275,19 @@ class Samples(torch.utils.data.IterableDataset):
 
 
 def statistics(roots, config):
-    """Mean and std of the input state features and of the action features, from random train samples."""
+    """Affine normalization parameters for both observation states and action chunks."""
+    if config.rebot_quantile_stats:
+        source = json.loads(Path(config.rebot_quantile_stats).read_text())['norm_stats']
+        result = {}
+        for key, group, dim in [('state', 'input', STATE_DIM), ('actions', 'action', FEATURE_DIM)]:
+            lo, hi = (np.asarray(source[key][q], dtype=np.float64) for q in ('q01', 'q99'))
+            if lo.shape != (dim,) or hi.shape != (dim,) or not np.isfinite([lo, hi]).all() or np.any(hi <= lo):
+                raise ValueError(f'Invalid {key} quantile bounds in {config.rebot_quantile_stats}')
+            # The ReBot exporter sets rotation bounds to [-1, 1], giving center=0 and scale=1.
+            # These checkpoint buffers also feed prefix encoding and output denormalization.
+            result[f'{group}_mean'] = ((hi + lo) / 2).tolist()
+            result[f'{group}_std'] = ((hi - lo) / 2).tolist()
+        return result
     samples = Samples(roots, config, seed=config.seed, images=False)
     rng = np.random.default_rng(config.seed)
     inputs, targets = [], []

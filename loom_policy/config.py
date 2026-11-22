@@ -11,6 +11,7 @@ class Config:
     obs_stride: int = 10             # observation subsampling step (open question in the design)
     current_frames: int = 2          # observed frames of the current segment, ending at t
     absolute_state: bool = False     # encode the observed 26D contract state at each frame
+    rebot_quantile_stats: str | None = None  # openpi ReBot norm_stats.json for the training dataset
     ref_frames: int = 32             # observed frames of one reference segment, at most
     max_refs: int = 2                # training draws 0..max_refs reference segments per sample
     horizon: int = 50                # action slots: frames t+1 .. t+horizon
@@ -48,6 +49,8 @@ class Config:
 
     def __post_init__(self):
         self.image_size = tuple(self.image_size)
+        if self.rebot_quantile_stats and not self.absolute_state:
+            raise ValueError('ReBot quantiles require absolute 26D observations')
         if type(self.max_prefix_len) is not int or self.max_prefix_len < 0 or self.horizon < 1:
             raise ValueError('max_prefix_len must be a nonnegative integer and horizon must be positive')
         if self.trunk_dim is None:
