@@ -22,22 +22,34 @@ conda activate loom-policy && pytest
 新训练默认使用 LOOM 2B。`--data` 可以是数据集目录、源目录或导出根目录。如果输出目录已有 `last.pt`，会按 checkpoint 中的配置续训。
 
 ```bash
-loom-train --data <数据目录>... --output runs/<name>
+loom-policy train --data <数据目录>... --output runs/<name>
 ```
 
 多卡：
 
 ```bash
-torchrun --nproc_per_node 8 -m loom_policy.train --data <数据目录>... --output runs/<name>
+torchrun --nproc_per_node 8 -m loom_policy train --data <数据目录>... --output runs/<name>
 ```
 
 离线评估，同一个模型只换参考数量：
 
 ```bash
-loom-eval --checkpoint runs/<name>/last.pt --data <数据目录>... --refs 0 1 2
+loom-policy eval --checkpoint runs/<name>/last.pt --data <数据目录>... --refs 0 1 2
 ```
 
 部署用 `loom_policy.policy.Policy`：`set_references` 把参考编码一次，`act` 每步返回未来 50 帧的目标位姿。
+
+### 本机 ReBot 策略服务
+
+在 LOOM-policy 仓库中启用环境，首次安装控制器仓库内的通信包和服务依赖：
+
+```bash
+conda activate loom-policy
+python -m pip install /path/to/rebot_control/policy_link -e '.[rebot]'
+loom-policy serve --checkpoint ../models/rebot-packing-p1p99/step-20000.pt
+```
+
+服务使用 LOOM 的 PyTorch 推理，在 GPU 预热后监听 `ws://127.0.0.1:8010`。控制端沿用 `rebot policy` 的连接方式，指定 `--port 8010`。服务接收 top、left_wrist、right_wrist 三路 JPEG 和双臂绝对状态，按 30 Hz 返回目标。Packing 模型默认使用 3 步 RTC 前缀，可用 `--rtc-prefix-steps` 选择 1 至 6 步。
 
 ReBot 单帧无参考实验使用 `--config configs/rebot_observation.json`。每个样本读取当前三视角图像、任务指令和数据集坐标系下的双臂绝对状态（每臂 xyz、按列展开的旋转矩阵和夹爪开合度，共 26 维）。动作目标仍以当前位姿为基准，共 20 维，训练前缀长度为 0 到 6。状态和动作分别按 P1/P99 缩放位置与夹爪，旋转坐标保留原值。默认从训练样本估计分位数。
 

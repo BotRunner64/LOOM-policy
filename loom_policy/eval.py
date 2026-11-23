@@ -37,15 +37,15 @@ def evaluate(model, samples, batches, batch_size, device):
     return totals
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, *, prog=None):
+    parser = argparse.ArgumentParser(prog=prog, description=__doc__)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--data', nargs='+', required=True, help='dataset roots or folders of them')
     parser.add_argument('--refs', type=int, nargs='+', default=[0, 1], help='numbers of reference segments to compare')
     parser.add_argument('--split', default='val', choices=('train', 'val'))
     parser.add_argument('--batches', type=int, default=32)
     parser.add_argument('--batch-size', type=int, default=16)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = load_model(args.checkpoint, device)
     roots = find_datasets(args.data)

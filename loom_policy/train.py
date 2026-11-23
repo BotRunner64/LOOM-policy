@@ -15,8 +15,8 @@ from loom_policy.eval import evaluate
 from loom_policy.model import LoomPolicy
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, *, prog=None):
+    parser = argparse.ArgumentParser(prog=prog, description=__doc__)
     parser.add_argument('--data', nargs='+', required=True, help='dataset roots or folders of them')
     parser.add_argument('--output', required=True, type=Path, help='run directory; resumed if it has last.pt')
     parser.add_argument('--config', help='JSON config file')
