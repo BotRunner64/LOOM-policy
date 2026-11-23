@@ -20,11 +20,30 @@ def main(argv=None, *, prog=None):
     parser.add_argument('--data', nargs='+', required=True, help='dataset roots or folders of them')
     parser.add_argument('--output', required=True, type=Path, help='run directory; resumed if it has last.pt')
     parser.add_argument('--config', help='JSON config file')
-    parser.add_argument('--stop-at-step', type=int, help='checkpoint and exit early at this absolute step')
+    limit = parser.add_mutually_exclusive_group()
+    limit.add_argument('--job-steps', type=int, help='maximum additional optimizer steps for this job')
+    limit.add_argument('--stop-at-step', type=int, help='checkpoint and exit early at this absolute step')
     parser.add_argument('--set', nargs='*', default=[], metavar='KEY=VALUE', help='config overrides')
     args = parser.parse_args(argv)
+    if args.job_steps is not None and args.job_steps < 1:
+        parser.error('--job-steps must be positive')
 
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
+    checkpoint = args.output / 'last.pt'
+    state = torch.load(checkpoint, map_location='cpu', weights_only=True, mmap=True) if checkpoint.exists() else None
+    # The plan travels with the checkpoint. Job limits apply only to this invocation.
+    config = Config.from_checkpoint(state['config']) if state else Config.load(args.config, args.set)
+    step = state['step'] if state else 0
+    stop = config.steps
+    if args.job_steps is not None:
+        stop = min(stop, step + args.job_steps)
+    elif args.stop_at_step is not None:
+        stop = min(stop, args.stop_at_step)
+    if rank == 0:
+        print(f'Plan: {config.steps} steps. Job: step {step} to {max(step, stop)}.', flush=True)
+    if step >= stop:
+        return
+
     cuda = torch.cuda.is_available()
     device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}" if cuda else 'cpu')
     if cuda:
@@ -32,10 +51,6 @@ def main(argv=None, *, prog=None):
     if world > 1:
         torch.distributed.init_process_group('nccl' if cuda else 'gloo')
 
-    checkpoint = args.output / 'last.pt'
-    state = torch.load(checkpoint, map_location='cpu', weights_only=True, mmap=True) if checkpoint.exists() else None
-    # A resumed run keeps its own config; only a new run reads --config and --set.
-    config = Config.from_checkpoint(state['config']) if state else Config.load(args.config, args.set)
     roots = find_datasets(args.data)
     torch.manual_seed(config.seed)
     # DDP broadcasts rank zero's normalization buffers when wrapping the model.
@@ -43,11 +58,9 @@ def main(argv=None, *, prog=None):
     model = LoomPolicy(config, stats).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, betas=(0.9, config.adam_beta2),
                                   weight_decay=config.weight_decay, fused=cuda)
-    step = 0
     if state:
         model.load_state_dict(state['model'])
         optimizer.load_state_dict(state['optimizer'])
-        step = state['step']
         del state
     schedule = lambda s: min((s + 1) / config.warmup, 0.5 * (1 + math.cos(math.pi * min(s / config.steps, 1))))
     # On resume the loaded optimizer state carries initial_lr, which LambdaLR needs to continue.
@@ -70,8 +83,7 @@ def main(argv=None, *, prog=None):
         pin_memory=cuda, persistent_workers=config.workers > 0, prefetch_factor=4 if config.workers else None))
 
     model.train()
-    started, window = time.time(), 0.
-    stop = config.steps if args.stop_at_step is None else min(config.steps, args.stop_at_step)
+    started, window, window_start = time.time(), 0., step
     while step < stop:
         batch = batch_to(next(loader), device)
         optimizer.zero_grad(set_to_none=True)
@@ -84,14 +96,15 @@ def main(argv=None, *, prog=None):
         step += 1
         if rank:
             continue
-        window += loss.item() / config.log_every
+        window += loss.item()
         record = {}
-        if step % config.log_every == 0:
-            record = {'loss': window, 'lr': scheduler.get_last_lr()[0],
-                      'samples_per_s': config.log_every * config.batch_size * world / (time.time() - started)}
+        if step % config.log_every == 0 or step == stop:
+            count = step - window_start
+            record = {'loss': window / count, 'lr': scheduler.get_last_lr()[0],
+                      'samples_per_s': count * config.batch_size * world / (time.time() - started)}
             if cuda:
                 record['peak_allocated_gib'] = torch.cuda.max_memory_allocated(device) / 2**30
-            started, window = time.time(), 0.
+            started, window, window_start = time.time(), 0., step
         if validation and (step % config.eval_every == 0 or step == config.steps):
             metrics = evaluate(model, validation, config.eval_batches, config.batch_size, device)
             record.update({f'val_{key}': value for key, value in metrics.items()})

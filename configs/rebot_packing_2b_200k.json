@@ -1,0 +1,18 @@
+{
+  "absolute_state": true,
+  "rebot_quantile_stats": "../openpi_rebot/data/packing_rtc_gop2_20261119_h50/rebot/norm_stats.json",
+  "current_frames": 1,
+  "max_refs": 0,
+  "max_prefix_len": 6,
+  "batch_size": 8,
+  "steps": 200000,
+  "lr": 0.0001,
+  "warmup": 1000,
+  "adam_beta2": 0.95,
+  "weight_decay": 0.05,
+  "grad_clip": 1.0,
+  "workers": 4,
+  "val_fraction": 0.0,
+  "log_every": 10,
+  "save_every": 500
+}

@@ -51,28 +51,29 @@ def test_rebot_single_absolute_state(dataset, tmp_path):
     np.testing.assert_array_equal(chunk[:3], prefix)
 
 
-def run(dataset, directory, steps):
+def run(dataset, directory, steps, *job_args):
     overrides = ['image_size=[32,48]', 'obs_stride=3', 'ref_frames=5', 'horizon=8', 'dim=32', 'heads=2',
                  'num_latents=4', 'reader_blocks=1', 'reader_self_layers=1',
                  'trunk_dim=32', 'trunk_heads=2', 'trunk_layers=2', 'workers=0',
                  'batch_size=4', 'stats_samples=20', 'val_fraction=0.4', 'eval_batches=1', 'warmup=2',
                  f'steps={steps}', 'log_every=2', 'eval_every=4', 'save_every=4']
-    train.main(['--data', str(dataset), '--output', str(directory), '--set', *overrides])
+    train.main(['--data', str(dataset), '--output', str(directory), *job_args, '--set', *overrides])
 
 
 def test_train_resume_evaluate_and_act(dataset, tmp_path):
-    run(dataset, tmp_path, 4)
+    run(dataset, tmp_path, 8, '--job-steps', '3')
     first = torch.load(tmp_path / 'last.pt', weights_only=True)
-    assert first['step'] == 4
-    # A finished run does nothing more; its config, not the command line, decides the length.
-    run(dataset, tmp_path, 8)
-    assert torch.load(tmp_path / 'last.pt', weights_only=True)['step'] == 4
-    first['config']['steps'] = 8
-    torch.save(first, tmp_path / 'last.pt')
-    run(dataset, tmp_path, 8)
+    assert first['step'] == 3 and first['config']['steps'] == 8
+    run(dataset, tmp_path, 8, '--job-steps', '3')
+    assert torch.load(tmp_path / 'last.pt', weights_only=True)['step'] == 6
+    # The saved plan caps the third job even when command-line overrides request more.
+    run(dataset, tmp_path, 100, '--job-steps', '3')
+    run(dataset, tmp_path, 100, '--job-steps', '3')
     assert torch.load(tmp_path / 'last.pt', weights_only=True)['step'] == 8
     records = [json.loads(line) for line in (tmp_path / 'metrics.jsonl').read_text().splitlines()]
-    assert [r['step'] for r in records] == [2, 4, 6, 8] and 'val_translation_m' in records[-1]
+    assert [r['step'] for r in records] == [2, 3, 4, 6, 8] and 'val_translation_m' in records[-1]
+    for r in records:
+        np.testing.assert_allclose(r['lr'], first['config']['lr'] * (1 + np.cos(np.pi * r['step'] / 8)) / 2)
 
     model = load_model(tmp_path / 'last.pt', torch.device('cpu'))
     assert 0 < model.action_scale.min() < 1  # statistics travel with the checkpoint

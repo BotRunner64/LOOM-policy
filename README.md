@@ -31,6 +31,15 @@ loom-policy train --data <数据目录>... --output runs/<name>
 torchrun --nproc_per_node 8 -m loom_policy train --data <数据目录>... --output runs/<name>
 ```
 
+分多次提交时，`steps` 决定整个计划的总步数和学习率曲线。Packing 的 200,000 步计划使用 `configs/rebot_packing_2b_200k.json`。第一段在全局第 50,000 步保存退出，平台重试也沿用这个终点。
+
+```bash
+torchrun --nproc_per_node 8 -m loom_policy train --config configs/rebot_packing_2b_200k.json \
+  --data <packing数据目录> --output runs/packing-200k --stop-at-step 50000
+```
+
+后续作业使用同一输出目录，把 `--stop-at-step` 改为下一段的全局终点。也可以用 `--job-steps 50000` 表示从本次启动时的断点再跑最多 50,000 步。每次作业结束都会写入 `last.pt`，意外中断时从最近一次保存恢复。恢复会接上 AdamW 和学习率进度，数据采样和 RTC 前缀会重新设种子。
+
 离线评估，同一个模型只换参考数量：
 
 ```bash
