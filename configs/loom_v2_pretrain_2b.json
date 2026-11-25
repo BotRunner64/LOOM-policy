@@ -1,0 +1,21 @@
+{
+  "trunk_dim": 2560,
+  "trunk_heads": 40,
+  "trunk_layers": 25,
+  "absolute_state": false,
+  "current_frames": 2,
+  "max_refs": 0,
+  "horizon": 50,
+  "epochs": 1,
+  "global_batch_size": 128,
+  "batch_size": 1,
+  "workers": 4,
+  "lr": 0.0003,
+  "warmup_epochs": 0.005,
+  "decay_epochs": 0.1,
+  "seed": 0,
+  "val_fraction": 0.02,
+  "log_every": 50,
+  "eval_every": 1000,
+  "save_every": 500
+}

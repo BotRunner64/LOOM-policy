@@ -41,7 +41,7 @@ def main(argv=None, *, prog=None):
     parser = argparse.ArgumentParser(prog=prog, description=__doc__)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--data', nargs='+', required=True, help='dataset roots or folders of them')
-    parser.add_argument('--refs', type=int, nargs='+', default=[0, 1], help='numbers of reference segments to compare')
+    parser.add_argument('--refs', type=int, nargs='+', default=[0], help='numbers of reference segments to evaluate (default: 0)')
     parser.add_argument('--split', default='val', choices=('train', 'val'))
     parser.add_argument('--batches', type=int, default=32)
     parser.add_argument('--batch-size', type=int, default=16)

@@ -13,7 +13,7 @@ class Config:
     absolute_state: bool = False     # encode the observed 26D contract state at each frame
     rebot_quantile_stats: str | None = None  # openpi ReBot norm_stats.json for the training dataset
     ref_frames: int = 32             # observed frames of one reference segment, at most
-    max_refs: int = 2                # training draws 0..max_refs reference segments per sample
+    max_refs: int = 0                # training draws 0..max_refs reference segments per sample
     horizon: int = 50                # action slots: frames t+1 .. t+horizon
     max_text_bytes: int = 256        # longer instructions are an error, never truncated
 

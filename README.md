@@ -31,7 +31,27 @@ loom-policy train --data <数据目录>... --output runs/<name>
 torchrun --nproc_per_node 8 -m loom_policy train --data <数据目录>... --output runs/<name>
 ```
 
-### 按 epoch 训练，GBS 128 和 WSD
+### loom:v2 全量预训练
+
+`configs/loom_v2_pretrain_2b.json` 从头训练 LOOM 2B。六个数据来源均使用零参考段（`max_refs=0`）。每个样本取当前 episode 内最多两帧观测、任务指令和 50 帧动作目标。按 episode 划分约 2% 验证集，归一化统计从训练集估计。在 `pretrain-1kh-20261120` 上，一轮遍历 116,328,661 个训练锚点。GBS 128 对应 908,818 次更新，尾批 85 个样本。
+
+WSD 在前 0.005 轮线性预热至 `3e-4`，维持到 0.9 轮，最后 0.1 轮余弦衰减至零。每 50 次更新记录训练指标，每 1,000 次更新验证，每 500 次更新和训练结束时更新 `last.pt`。
+
+在启智公共科研项目提交普通优先级 H200 作业时挂载 `--dataset loom:v2`。下面是单机 8 卡的作业启动命令，checkpoint 和日志写入全局个人盘。
+
+```bash
+work=/inspire/hdd/global_user/czxs253130598
+cd "$work/projects/my_projects/LOOM-policy" && \
+  "$work/cache/conda/envs/loom-policy/bin/python" -m torch.distributed.run \
+    --standalone --nproc-per-node=8 --module loom_policy train \
+    --config configs/loom_v2_pretrain_2b.json \
+    --data /inspire/dataset/loom/v2/pretrain-1kh-20261120 \
+    --output "$work/runs/loom-v2-pretrain-2b"
+```
+
+预设从每卡 1 个样本起步。8 卡时每次完整更新累积 16 次。实测显存后，可通过 `--micro-batch-size` 调整每卡上限。换卡续训时挂载同一数据版本，沿用原输出目录，训练器会从最近一次保存的位置接着训练。
+
+### Packing 单任务训练
 
 Packing 预设默认训练 100 个 epoch。每轮打乱所有有完整未来动作窗口的训练锚点，每个锚点用一次。当前 Packing 数据每轮有 115,888 个锚点，GBS 128 下每轮更新 906 次（尾批 48 个样本），全程共更新 90,600 次。
 
@@ -46,10 +66,10 @@ torchrun --nproc_per_node 8 -m loom_policy train --config configs/rebot_packing_
 
 下一段可用 `--stop-at-epoch 50` 在第 50 轮结束后保存。轮内中断也可以从最近的 checkpoint 接着训练。稳定阶段可用 `--wsd-end-epoch` 调整计划总轮数，衰减仍占最后 10 轮。
 
-离线评估，同一个模型只换参考数量：
+离线评估默认使用零参考段。Packing 使用全量 episode 训练，下面在训练集上检查拟合情况。
 
 ```bash
-loom-policy eval --checkpoint runs/<name>/last.pt --data <数据目录>... --refs 0 1 2
+loom-policy eval --checkpoint runs/packing-wsd/last.pt --data <packing数据目录> --split train
 ```
 
 部署用 `loom_policy.policy.Policy`：`set_references` 把参考编码一次，`act` 每步返回未来 50 帧的目标位姿。
