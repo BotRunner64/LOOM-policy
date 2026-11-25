@@ -31,14 +31,20 @@ loom-policy train --data <数据目录>... --output runs/<name>
 torchrun --nproc_per_node 8 -m loom_policy train --data <数据目录>... --output runs/<name>
 ```
 
-分多次提交时，`steps` 决定整个计划的总步数和学习率曲线。Packing 的 200,000 步计划使用 `configs/rebot_packing_2b_200k.json`。第一段在全局第 50,000 步保存退出，平台重试也沿用这个终点。
+### 按 epoch 训练，GBS 128 和 WSD
+
+Packing 预设默认训练 100 个 epoch。每轮打乱所有有完整未来动作窗口的训练锚点，每个锚点用一次。当前 Packing 数据每轮有 115,888 个锚点，GBS 128 下每轮更新 906 次（尾批 48 个样本），全程共更新 90,600 次。
+
+WSD 在前 0.5 轮线性预热，随后维持峰值学习率 0.0001，完成 90 轮后开始最后 10 轮的余弦衰减。下面的命令使用完整的 100 轮计划，第一段作业在第 25 轮结束时保存退出。
 
 ```bash
-torchrun --nproc_per_node 8 -m loom_policy train --config configs/rebot_packing_2b_200k.json \
-  --data <packing数据目录> --output runs/packing-200k --stop-at-step 50000
+torchrun --nproc_per_node 8 -m loom_policy train --config configs/rebot_packing_2b_gbs128_wsd.json \
+  --data <packing数据目录> --output runs/packing-wsd --stop-at-epoch 25
 ```
 
-后续作业使用同一输出目录，把 `--stop-at-step` 改为下一段的全局终点。也可以用 `--job-steps 50000` 表示从本次启动时的断点再跑最多 50,000 步。每次作业结束都会写入 `last.pt`，意外中断时从最近一次保存恢复。恢复会接上 AdamW 和学习率进度，数据采样和 RTC 前缀会重新设种子。
+续训时使用同一输出目录，以及相同的数据和数据目录顺序。按每卡最多 8 个样本，2、4、8、16 卡分别累积 8、4、2、1 次；32、64 卡分别每卡取 4、2 个样本，均更新一次。其他卡数按 rank 均分余数；可用 `--micro-batch-size` 调低本次作业的上限。采样位置和 RTC 前缀由已提交的全局更新确定，跨卡数或 worker 数恢复时可接回同一批数据。
+
+下一段可用 `--stop-at-epoch 50` 在第 50 轮结束后保存。轮内中断也可以从最近的 checkpoint 接着训练。稳定阶段可用 `--wsd-end-epoch` 调整计划总轮数，衰减仍占最后 10 轮。
 
 离线评估，同一个模型只换参考数量：
 
@@ -62,7 +68,7 @@ loom-policy serve --checkpoint ../models/rebot-packing-p1p99/step-20000.pt
 
 ReBot 单帧无参考实验使用 `--config configs/rebot_observation.json`。每个样本读取当前三视角图像、任务指令和数据集坐标系下的双臂绝对状态（每臂 xyz、按列展开的旋转矩阵和夹爪开合度，共 26 维）。动作目标仍以当前位姿为基准，共 20 维，训练前缀长度为 0 到 6。状态和动作分别按 P1/P99 缩放位置与夹爪，旋转坐标保留原值。默认从训练样本估计分位数。
 
-Packing 从头训练使用 `configs/rebot_packing_2b.json`，8 卡各 8 个样本，训练 20,000 步，全量 episode 参与训练。该配置从相邻的 openpi_rebot 仓库读取本次 packing 数据的 P1/P99 统计文件，将状态和动作的位置与夹爪缩放到分位点对应的 −1 和 +1，保留超出分位点的值及旋转原值。部署和续训从 checkpoint 读取归一化参数。AdamW 峰值学习率为 1e-4，预热 1,000 步，余弦衰减，每 500 步保存一次。用同一输出目录重启会加载最新 checkpoint。
+Packing 预设从相邻的 openpi_rebot 仓库读取 P1/P99 统计文件，每 500 次更新保存一次 checkpoint。部署和续训从 checkpoint 读取归一化参数。
 
 ### 动作前缀
 

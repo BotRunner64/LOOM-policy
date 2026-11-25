@@ -1,7 +1,11 @@
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
+import pytest
 import torch
 
 from loom_policy import train
@@ -12,6 +16,75 @@ from loom_policy.policy import Policy
 from loom_policy.data import Source
 from loom_policy.geometry import relative
 from loom_policy.model import LoomPolicy
+
+
+def test_gbs128_partitions():
+    for cap in (1, 8):
+        for world in range(2, 65):
+            groups = [train.micro_batches(128, world, rank, cap) for rank in range(world)]
+            assert len({len(rank_groups) for rank_groups in groups}) == 1
+            assert max(len(batch) for rank_groups in groups for batch in rank_groups) <= cap
+            assert sorted(i for rank_groups in groups for batch in rank_groups for i in batch) == list(range(128))
+
+
+def test_epoch_anchor_coverage_and_resume(dataset, config):
+    samples = Samples([dataset], config, images=False)
+    n = int(samples.cumulative[-1])
+    layout = train.BatchLayout(8, n)
+    def sequence(world, cap, start, stop):
+        items = [item for rank in range(world)
+                 for group in layout.index_batches(start, stop, world, rank, cap, config.seed) for item in group]
+        return sorted(set(items))  # empty shards reuse a zero-weight placeholder
+
+    steps = layout.steps_per_epoch
+    ordered = sequence(1, 8, 0, 2 * steps)
+    anchors = [a for _, a in ordered]
+    assert sorted(anchors[:n]) == sorted(anchors[n:]) == list(range(n))
+    assert anchors[:n] != anchors[n:]
+    split = steps - 1
+    assert sequence(3, 1, 0, split) + sequence(2, 2, split, 2 * steps) == ordered
+    # Check both ends of every episode, including the last eligible anchor.
+    start = 0
+    for number, ep, length in samples.episodes:
+        states, _ = samples.sources[number].frames(ep)
+        for t in (0, length - config.horizon - 1):
+            drawn = samples.sample(np.random.default_rng(0), anchor=start + t)
+            np.testing.assert_array_equal(drawn['target'], relative(states[t], states[t+1:t+1+config.horizon]))
+        start += length - config.horizon
+
+
+def test_wsd_changed_world_resume(dataset, tmp_path, config):
+    # Ten eligible anchors, hence global update sizes 3, 3, 3, 1 per epoch.
+    config.global_batch_size = 3
+    config.horizon, config.epochs = 51, 3
+    config.warmup_epochs, config.decay_epochs = 0.6, 0.5
+    config.log_every = 1
+    config_path = tmp_path / 'wsd.json'
+    config_path.write_text(json.dumps(config.to_dict()))
+    common = ['--data', str(dataset), '--config', str(config_path)]
+    python = [sys.executable, '-m']
+    env = {**os.environ, 'CUDA_VISIBLE_DEVICES': '', 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
+    def job(run_dir, ranks, *extra):
+        launch = python if ranks == 1 else [*python, 'torch.distributed.run', '--standalone',
+                                            '--nproc-per-node', str(ranks), '-m']
+        subprocess.run([*launch, 'loom_policy', 'train', *common, '--output', str(run_dir), *extra],
+                       env=env, check=True, timeout=120)
+
+    control, resumed = tmp_path / 'control', tmp_path / 'resumed'
+    job(control, 1, '--wsd-end-epoch', '2')
+    job(resumed, 2, '--micro-batch-size', '1', '--stop-at-epoch', '1')
+    job(resumed, 1, '--wsd-end-epoch', '2')
+    a, b = [torch.load(d / 'last.pt', weights_only=True) for d in (control, resumed)]
+    assert a['consumed_samples'] == b['consumed_samples'] == 20
+    assert a['step'] == b['step'] == 8
+    for name, weight in a['model'].items():
+        torch.testing.assert_close(b['model'][name], weight, atol=2e-5, rtol=1e-4)
+    records = [json.loads(line) for line in (resumed / 'metrics.jsonl').read_text().splitlines()]
+    assert b['epoch_size'] == 10 and b['config']['epochs'] == 2
+    assert [r['global_batch_size'] for r in records] == [3, 3, 3, 1] * 2
+    np.testing.assert_allclose([r['epoch'] for r in records], [.3, .6, .9, 1, 1.3, 1.6, 1.9, 2])
+    np.testing.assert_allclose([r['lr'] for r in records[-3:]],
+                               config.lr * (1 - np.cos(np.pi * np.array([.8, .2, 0]))) / 2)
 
 
 def test_rebot_single_absolute_state(dataset, tmp_path):
@@ -51,29 +124,31 @@ def test_rebot_single_absolute_state(dataset, tmp_path):
     np.testing.assert_array_equal(chunk[:3], prefix)
 
 
-def run(dataset, directory, steps, *job_args):
-    overrides = ['image_size=[32,48]', 'obs_stride=3', 'ref_frames=5', 'horizon=8', 'dim=32', 'heads=2',
-                 'num_latents=4', 'reader_blocks=1', 'reader_self_layers=1',
-                 'trunk_dim=32', 'trunk_heads=2', 'trunk_layers=2', 'workers=0',
-                 'batch_size=4', 'stats_samples=20', 'val_fraction=0.4', 'eval_batches=1', 'warmup=2',
-                 f'steps={steps}', 'log_every=2', 'eval_every=4', 'save_every=4']
-    train.main(['--data', str(dataset), '--output', str(directory), *job_args, '--set', *overrides])
+def test_train_resume_evaluate_and_act(dataset, tmp_path, config, monkeypatch):
+    config.trunk_dim, config.trunk_heads = config.dim, config.heads
+    config.val_fraction = 0.4
+    config.eval_batches = config.epochs = 1
+    config.log_every = config.save_every = 2
+    config.global_batch_size = 8
+    path = tmp_path / 'plan.json'
+    path.write_text(json.dumps(config.to_dict()))
+    args = ['--data', str(dataset), '--output', str(tmp_path), '--config', str(path)]
+    replace = os.replace
 
+    def interrupt_after_checkpoint(src, dest):
+        replace(src, dest)
+        raise InterruptedError
 
-def test_train_resume_evaluate_and_act(dataset, tmp_path):
-    run(dataset, tmp_path, 8, '--job-steps', '3')
+    with monkeypatch.context() as patch:
+        patch.setattr(train.os, 'replace', interrupt_after_checkpoint)
+        with pytest.raises(InterruptedError):
+            train.main(args)
     first = torch.load(tmp_path / 'last.pt', weights_only=True)
-    assert first['step'] == 3 and first['config']['steps'] == 8
-    run(dataset, tmp_path, 8, '--job-steps', '3')
-    assert torch.load(tmp_path / 'last.pt', weights_only=True)['step'] == 6
-    # The saved plan caps the third job even when command-line overrides request more.
-    run(dataset, tmp_path, 100, '--job-steps', '3')
-    run(dataset, tmp_path, 100, '--job-steps', '3')
-    assert torch.load(tmp_path / 'last.pt', weights_only=True)['step'] == 8
+    assert first['step'] == 2 and first['consumed_samples'] == 16 < first['epoch_size']
+    train.main(args)
     records = [json.loads(line) for line in (tmp_path / 'metrics.jsonl').read_text().splitlines()]
-    assert [r['step'] for r in records] == [2, 3, 4, 6, 8] and 'val_translation_m' in records[-1]
-    for r in records:
-        np.testing.assert_allclose(r['lr'], first['config']['lr'] * (1 + np.cos(np.pi * r['step'] / 8)) / 2)
+    assert records[-1]['epoch'] == 1 and 'val_translation_m' in records[-1]
+    assert [r['step'] for r in records] == sorted({r['step'] for r in records})
 
     model = load_model(tmp_path / 'last.pt', torch.device('cpu'))
     assert 0 < model.action_scale.min() < 1  # statistics travel with the checkpoint

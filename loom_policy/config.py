@@ -32,11 +32,13 @@ class Config:
     # Training.
     max_prefix_len: int = 4          # upper bound on known actions, always leaving one frame to predict
     batch_size: int = 32
-    steps: int = 100_000
+    global_batch_size: int = 128  # fixed samples per update; batch_size caps each rank's micro-batch
+    epochs: int = 1            # full shuffled passes through all eligible training anchors
+    warmup_epochs: float = 0.005
+    decay_epochs: float = 0.1
     lr: float = 3e-4
     weight_decay: float = 0.05
     adam_beta2: float = 0.999
-    warmup: int = 1000
     grad_clip: float = 1.0
     workers: int = 8
     seed: int = 0
@@ -49,6 +51,11 @@ class Config:
 
     def __post_init__(self):
         self.image_size = tuple(self.image_size)
+        if any(type(n) is not int or n < 1 for n in (self.batch_size, self.global_batch_size, self.epochs)):
+            raise ValueError('batch sizes and epochs must be positive integers')
+        if not (self.warmup_epochs >= 0 and self.decay_epochs > 0
+                and self.warmup_epochs + self.decay_epochs <= self.epochs):
+            raise ValueError('WSD warmup and decay must fit within the epoch plan')
         if self.rebot_quantile_stats and not self.absolute_state:
             raise ValueError('ReBot quantiles require absolute 26D observations')
         if type(self.max_prefix_len) is not int or self.max_prefix_len < 0 or self.horizon < 1:
@@ -68,6 +75,7 @@ class Config:
     @classmethod
     def from_checkpoint(cls, values):
         # Older checkpoints inherited the reader width and head count for the trunk.
+        values = {f.name: values[f.name] for f in fields(cls) if f.name in values}
         return cls(**{'adaptive_rgb': False, 'num_latents': 64, 'share_reference_budget': False,
                       'trunk_dim': None, 'trunk_heads': None, 'trunk_layers': 8, **values})
 

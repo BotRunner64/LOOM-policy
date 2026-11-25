@@ -207,7 +207,9 @@ class LoomPolicy(nn.Module):
             target = (batch['target'] - self.action_center) / self.action_scale
             if self.training:
                 max_len = min(self.config.max_prefix_len, self.config.horizon - 1)
-                lengths = torch.randint(max_len + 1, (samples,), device=target.device)
+                lengths = batch.get('prefix_lengths')
+                if lengths is None:
+                    lengths = torch.randint(max_len + 1, (samples,), device=target.device)
                 prefix_mask = torch.arange(self.config.horizon, device=target.device) < lengths[:, None]
                 prefix_norm = target.masked_fill(~prefix_mask[..., None], 0)
         prediction = self.decode(self.encode(batch), batch['seg_sample'], batch['seg_kind'], samples,

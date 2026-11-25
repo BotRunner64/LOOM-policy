@@ -203,8 +203,8 @@ def batch_to(batch, device):
     return moved
 
 
-class Samples(torch.utils.data.IterableDataset):
-    """Endless random samples from the train or val episodes of the given datasets.
+class Samples(torch.utils.data.Dataset):
+    """Action windows indexed by (draw position, anchor) within the train or val episodes.
 
     `num_refs` fixes the number of reference segments (None draws 0..max_refs);
     `images=False` skips video decoding, for statistics.
@@ -244,11 +244,13 @@ class Samples(torch.utils.data.IterableDataset):
         images = source.images(episode, frames.tolist(), config.image_size, patch) if self.with_images else None
         return make_segment(kind, features, frames - end, texts, images, source.cameras, config.max_text_bytes)
 
-    def sample(self, rng):
+    def sample(self, rng, anchor=None):
         config = self.config
-        pick = int(np.searchsorted(self.cumulative, rng.integers(self.cumulative[-1]), side='right'))
+        position = rng.integers(self.cumulative[-1]) if anchor is None else anchor
+        pick = int(np.searchsorted(self.cumulative, position, side='right'))
         number, episode, length = self.episodes[pick]
-        t = int(rng.integers(length - config.horizon))
+        start = int(self.cumulative[pick - 1]) if pick else 0
+        t = int(rng.integers(length - config.horizon)) if anchor is None else anchor - start
         states, _ = self.sources[number].frames(episode)
         segments = [self.segment(CURRENT, number, episode, t, config.current_frames)]
         # Draw one spare, so that dropping the current episode still leaves `count` (no scan of the pool).
@@ -267,11 +269,9 @@ class Samples(torch.utils.data.IterableDataset):
         target = relative(states[t], states[t + 1:t + 1 + config.horizon])
         return {'segments': segments, 'target': torch.as_tensor(target)}
 
-    def __iter__(self):
-        worker = torch.utils.data.get_worker_info()
-        rng = np.random.default_rng([*np.atleast_1d(self.seed), worker.id if worker else 0])
-        while True:
-            yield self.sample(rng)
+    def __getitem__(self, index):
+        position, anchor = index
+        return self.sample(np.random.default_rng([self.seed, position]), anchor=anchor)
 
 
 def sampled_quantiles(roots, config):
