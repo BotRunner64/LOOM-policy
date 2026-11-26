@@ -81,6 +81,8 @@ def main(argv=None, *, prog=None):
     parser = argparse.ArgumentParser(prog=prog, description=__doc__)
     parser.add_argument('--data', nargs='+', required=True, help='dataset roots or folders of them')
     parser.add_argument('--output', required=True, type=Path, help='run directory; resumed if it has last.pt')
+    parser.add_argument('--packed', type=Path, help='packed export folder (loom-data pack) to read videos from; '
+                        'it must hold <source>/<layout> for every dataset')
     parser.add_argument('--config', help='JSON config file')
     parser.add_argument('--micro-batch-size', type=int, help='per-rank cap for this fixed-global-batch job')
     parser.add_argument('--wsd-end-epoch', type=int, help='change total epochs before WSD decay begins')
@@ -102,7 +104,7 @@ def main(argv=None, *, prog=None):
         parser.error('world size exceeds the planned global batch size')
     groups = micro_batches(global_batch, world, rank, cap)
     roots = find_datasets(args.data)
-    train_samples = Samples(roots, config, seed=config.seed)
+    train_samples = Samples(roots, config, seed=config.seed, packed=args.packed)
     epoch_size = int(train_samples.cumulative[-1])
     data_id = epoch_data_id(train_samples)
     if state and (state['epoch_size'] != epoch_size or state['epoch_data_id'] != data_id):
@@ -133,8 +135,12 @@ def main(argv=None, *, prog=None):
 
     torch.manual_seed(config.seed)
     # DDP broadcasts rank zero's normalization buffers when wrapping the model.
-    stats = statistics(roots, config) if state is None and rank == 0 else None
+    stats = statistics(roots, config, train_samples) if state is None and rank == 0 else None
     model = LoomPolicy(config, stats).to(device)
+    if cuda and config.compile:
+        # Trunk blocks have one fixed shape per micro-batch size; the reader's padded shapes vary, so it stays eager.
+        for block in model.trunk:
+            block.compile()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, betas=(0.9, config.adam_beta2),
                                   weight_decay=config.weight_decay, fused=cuda)
     if state:
@@ -151,12 +157,12 @@ def main(argv=None, *, prog=None):
         (args.output / 'config.json').write_text(json.dumps(config.to_dict(), indent=2) + '\n')
         print(f'{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters, '
               f'{len(roots)} datasets, step {step}/{total_steps}', flush=True)
-        validation = Samples(roots, config, split='val', seed=config.seed) if config.val_fraction else None
+        validation = Samples(roots, config, split='val', seed=config.seed, packed=args.packed) if config.val_fraction else None
 
     batches = layout.index_batches(step, stop, world, rank, cap, config.seed)
     loader = iter(torch.utils.data.DataLoader(
         train_samples, batch_sampler=batches, collate_fn=collate, num_workers=config.workers,
-        pin_memory=cuda, persistent_workers=config.workers > 0, prefetch_factor=4 if config.workers else None))
+        pin_memory=cuda, persistent_workers=config.workers > 0, prefetch_factor=2 if config.workers else None))
 
     model.train()
     started, window_start = time.time(), step

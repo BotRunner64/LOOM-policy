@@ -14,10 +14,12 @@ Token facts: frame offset (action slot k is offset +k), camera, segment kind;
 plus what a token needs to be read at all (modality, patch position, byte position).
 """
 from collections import defaultdict
+from contextlib import nullcontext
 import math
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn.functional as F
 
 from loom_policy.data import REFERENCE
@@ -67,9 +69,13 @@ class Block(nn.Module):
         context = query if context is None else self.norm_context(context)
         split = lambda t: t.unflatten(-1, (self.heads, -1)).transpose(1, 2)
         key, value = self.key_value(context).chunk(2, -1)
-        attended = F.scaled_dot_product_attention(
-            split(self.query(query)), split(key), split(value),
-            attn_mask=None if mask is None else mask[:, None, None])
+        # On CUDA: FlashAttention-2 without a mask, memory-efficient attention with one (FA2 takes no
+        # arbitrary mask). Never cuDNN, which builds a plan for every new padded length of the reader.
+        backend = SDPBackend.FLASH_ATTENTION if mask is None else SDPBackend.EFFICIENT_ATTENTION
+        with sdpa_kernel(backend) if x.is_cuda else nullcontext():
+            attended = F.scaled_dot_product_attention(
+                split(self.query(query)), split(key), split(value),
+                attn_mask=None if mask is None else mask[:, None, None])
         x = x + self.out(attended.transpose(1, 2).flatten(2))
         return x + self.mlp(self.norm_mlp(x))
 
@@ -133,19 +139,28 @@ class LoomPolicy(nn.Module):
                 groups[REFERENCE, count + (rank < extra)].append(index)
         return groups
 
+    def embed_patches(self, pixels):
+        """uint8 [N, 3, H, W] -> [N, H / patch, W / patch, dim].
+
+        The stride-patch convolution as one matmul over flattened patches: the same weights, without
+        cuDNN selecting kernels for every new image shape."""
+        patch = self.config.patch
+        pixels = (pixels.float() / 127.5 - 1).unflatten(2, (-1, patch)).unflatten(4, (-1, patch))
+        return F.linear(pixels.permute(0, 2, 4, 1, 3, 5).flatten(3), self.patch.weight.flatten(1), self.patch.bias)
+
     def encode(self, batch):
         """One [query count, dim] tensor per segment, in input order. Legacy checkpoints return a stack."""
         kind = batch['seg_kind']
         tokens, group = [], []
         base_grid = tuple(size // self.config.patch for size in self.config.image_size)
         for views in batch['image_groups']:
-            image = self.patch(views['pixels'].float() / 127.5 - 1)
+            image = self.embed_patches(views['pixels'])
             position = self.patch_position
-            if image.shape[-2:] != base_grid:
+            if image.shape[1:3] != base_grid:
                 grid = position.T.reshape(1, self.config.dim, *base_grid)
-                position = F.interpolate(grid, size=image.shape[-2:], mode='bicubic',
+                position = F.interpolate(grid, size=image.shape[1:3], mode='bicubic',
                                          align_corners=False).flatten(2)[0].T
-            image = image.flatten(2).transpose(1, 2)
+            image = image.flatten(1, 2)
             fact = self.offset(views['off']) + self.camera(views['cam']) + self.modality.weight[0]
             tokens.append((image + position + fact[:, None]).flatten(0, 1))
             group.append(views['seg'].repeat_interleave(image.shape[1]))
@@ -179,21 +194,31 @@ class LoomPolicy(nn.Module):
         return tuple(latents) if self.config.share_reference_budget else torch.stack(latents)
 
     def decode(self, latents, seg_sample, seg_kind, samples, prefix_norm=None, prefix_mask=None):
-        """Decode actions, optionally replacing slots selected by prefix_mask with normalized actions."""
+        """Decode actions, optionally replacing slots selected by prefix_mask with normalized actions.
+
+        latents are ordered by sample, as `encode` returns them for a collated batch."""
         horizon = self.config.horizon
-        counts = seg_sample.new_tensor([len(segment) for segment in latents])
-        latents = torch.cat(tuple(latents))
-        segment = torch.repeat_interleave(torch.arange(len(counts), device=latents.device), counts,
-                                          output_size=len(latents))
-        position = torch.arange(len(latents), device=latents.device) - (counts.cumsum(0) - counts)[segment]
-        latents = latents + self.latent_position[position] + self.latent_kind(seg_kind)[segment]
-        latents, mask = pad_groups(latents, seg_sample[segment], samples)
+        lengths = {len(segment) for segment in latents}
+        if len(latents) == samples and len(lengths) == 1:
+            # One segment per sample, all of one length (no references): no padding, and the trunk can
+            # use the fused attention kernels that take no mask.
+            latents = torch.stack(tuple(latents))
+            latents = latents + self.latent_position[:latents.shape[1]] + self.latent_kind(seg_kind)[:, None]
+            mask = None
+        else:
+            counts = seg_sample.new_tensor([len(segment) for segment in latents])
+            latents = torch.cat(tuple(latents))
+            segment = torch.repeat_interleave(torch.arange(len(counts), device=latents.device), counts,
+                                              output_size=len(latents))
+            position = torch.arange(len(latents), device=latents.device) - (counts.cumsum(0) - counts)[segment]
+            latents = latents + self.latent_position[position] + self.latent_kind(seg_kind)[segment]
+            latents, mask = pad_groups(latents, seg_sample[segment], samples)
+            mask = torch.cat((mask, mask.new_ones(samples, horizon)), 1)
         content = self.slot.expand(samples, horizon, -1)
         if prefix_norm is not None:
             content = torch.where(prefix_mask[..., None], self.prefix_proj(prefix_norm), content)
         slots = content + self.offset(torch.arange(1, horizon + 1, device=latents.device))
         x = self.trunk_in(torch.cat((latents, slots), 1))
-        mask = torch.cat((mask, mask.new_ones(samples, horizon)), 1)
         for layer in self.trunk:
             x = layer(x, mask=mask)
         return self.head(self.trunk_norm(x[:, -horizon:]))

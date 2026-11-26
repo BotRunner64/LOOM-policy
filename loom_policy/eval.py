@@ -41,6 +41,7 @@ def main(argv=None, *, prog=None):
     parser = argparse.ArgumentParser(prog=prog, description=__doc__)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--data', nargs='+', required=True, help='dataset roots or folders of them')
+    parser.add_argument('--packed', help='packed export folder (loom-data pack) to read videos from')
     parser.add_argument('--refs', type=int, nargs='+', default=[0], help='numbers of reference segments to evaluate (default: 0)')
     parser.add_argument('--split', default='val', choices=('train', 'val'))
     parser.add_argument('--batches', type=int, default=32)
@@ -50,7 +51,8 @@ def main(argv=None, *, prog=None):
     model = load_model(args.checkpoint, device)
     roots = find_datasets(args.data)
     for refs in args.refs:
-        samples = Samples(roots, model.config, split=args.split, seed=model.config.seed, num_refs=refs)
+        samples = Samples(roots, model.config, split=args.split, seed=model.config.seed, num_refs=refs,
+                          packed=args.packed)
         print(json.dumps({'refs': refs, **evaluate(model, samples, args.batches, args.batch_size, device)}))
 
 

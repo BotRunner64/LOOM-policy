@@ -93,9 +93,46 @@ def dataset(tmp_path_factory):
     return root
 
 
+@pytest.fixture(scope='session')
+def packed(dataset, tmp_path_factory):
+    """The dataset's videos in the LOOM-data packed format, written straight from its contract."""
+    root = tmp_path_factory.mktemp('packed')
+    directory = root / dataset.parent.name / dataset.name
+    (directory / 'shards').mkdir(parents=True)
+    keys = [f'observation.images.{camera}' for camera in ('top', 'left_wrist', 'right_wrist')]
+    episodes = pq.read_table(dataset / 'meta/episodes/chunk-000/file-000.parquet').to_pylist()
+    frames, rows, offset = [], [], 0
+    with open(directory / 'shards/000000.bin', 'wb') as shard:
+        for episode in episodes:
+            streams, extradata = [], []
+            for key in keys:
+                path = dataset / f'videos/{key}/chunk-000/file-{episode["episode_index"]:03d}.mp4'
+                with av.open(str(path)) as container:
+                    stream = container.streams.video[0]
+                    streams.append([(bytes(p), p.is_keyframe) for p in container.demux(stream) if p.size])
+                    extradata.append(bytes(stream.codec_context.extradata))
+            rows.append({'episode_index': episode['episode_index'], 'episode_id': episode['episode_id'],
+                         'length': episode['length'], 'shard': 0,
+                         **{f'{key}.extradata': data for key, data in zip(keys, extradata)}})
+            for k in range(episode['length']):
+                row = {'episode_index': episode['episode_index'], 'frame_index': k, 'offset': offset}
+                for key, stream in zip(keys, streams):
+                    data, keyframe = stream[k]
+                    shard.write(data)
+                    offset += len(data)
+                    row[f'{key}.size'], row[f'{key}.keyframe'] = len(data), keyframe
+                frames.append(row)
+    pq.write_table(pa.Table.from_pylist(rows), directory / 'episodes.parquet')
+    pq.write_table(pa.Table.from_pylist(frames), directory / 'frames.parquet')
+    (directory / 'info.json').write_text(json.dumps({
+        'format': 'loom-packed', 'version': 1, 'codec': 'h264', 'fps': 30, 'cameras': keys,
+        'episodes': len(rows), 'frames': len(frames), 'shards': [{'bytes': offset, 'sha256': ''}]}))
+    return root
+
+
 @pytest.fixture
 def config():
     return Config(image_size=(32, 48), obs_stride=3, current_frames=2, ref_frames=5, max_refs=2, horizon=8,
                   dim=32, heads=2, num_latents=4, reader_blocks=1, reader_self_layers=1,
                   trunk_dim=64, trunk_heads=4, trunk_layers=2,
-                  val_fraction=0., stats_samples=20, batch_size=3, workers=0)
+                  val_fraction=0., stats_samples=20, batch_size=3, workers=0, compile=False)

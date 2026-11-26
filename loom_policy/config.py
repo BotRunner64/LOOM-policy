@@ -41,6 +41,8 @@ class Config:
     adam_beta2: float = 0.999
     grad_clip: float = 1.0
     workers: int = 8
+    loader_threads: int = 16         # threads per worker reading the samples of one batch
+    compile: bool = True             # torch.compile the trunk blocks when training on CUDA
     seed: int = 0
     val_fraction: float = 0.02
     stats_samples: int = 2000        # samples used to estimate the normalization statistics

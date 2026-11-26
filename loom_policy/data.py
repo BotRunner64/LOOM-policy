@@ -6,9 +6,12 @@ segments (windows of other episodes of the same dataset) and the action target
 instruction text; every token carries its frame offset from the segment anchor,
 which is the last frame of the segment.
 """
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import copy
 import json
 import math
+import os
 from pathlib import Path
 import zlib
 
@@ -67,6 +70,8 @@ def read_frames(path, indices, size, patch=None):
     frames = []
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
+        # Loader threads already decode many files at once; per-file codec threads only add overhead.
+        stream.codec_context.thread_count = 1
         for index in indices:
             pts = round(index / FPS / stream.time_base)
             container.seek(pts, stream=stream)
@@ -79,10 +84,89 @@ def read_frames(path, indices, size, patch=None):
     return np.stack(frames)
 
 
-class Source:
-    """One dataset root."""
+class PackedVideos:
+    """Videos of one dataset in the LOOM-data packed format (docs/contract/packed-contract.md there).
 
-    def __init__(self, root):
+    Frames are read straight from large shard files by byte offset: no file is opened per sample
+    and no MP4 is parsed, which is what makes random frame access fast on network filesystems.
+    """
+
+    def __init__(self, directory, source):
+        self.directory = Path(directory)
+        info = json.loads((self.directory / 'info.json').read_text(encoding='utf-8'))
+        if info.get('format') != 'loom-packed' or info.get('version') != 1 or info.get('codec') != 'h264':
+            raise ValueError(f'{directory}: not a version 1 loom-packed directory')
+        self.keys = info['cameras']
+        if sorted(self.keys) != sorted(f'observation.images.{CAMERAS[c]}' for c in source.cameras):
+            raise ValueError(f'{directory}: cameras differ from {source.root}')
+        episodes = pq.read_table(self.directory / 'episodes.parquet')
+        identity = list(zip(*(episodes[c].to_pylist() for c in ('episode_index', 'episode_id', 'length'))))
+        if identity != [(row['episode_index'], row['episode_id'], row['length']) for row in source.episodes]:
+            raise ValueError(f'{directory}: packed from a different version of {source.root}; pack it again')
+        self.shard = episodes['shard'].to_numpy()
+        self.extradata = [episodes[f'{key}.extradata'].to_pylist() for key in self.keys]
+        frames = pq.read_table(self.directory / 'frames.parquet',
+                               columns=['offset', *(f'{key}.{field}' for key in self.keys for field in ('size', 'keyframe'))])
+        if frames.num_rows != source.offsets[-1]:
+            raise ValueError(f'{directory}: frame count differs from {source.root}')
+        self.offset = frames['offset'].to_numpy()
+        self.sizes = np.stack([frames[f'{key}.size'].to_numpy() for key in self.keys], axis=1).astype(np.int64)
+        self.keyframe = np.stack([frames[f'{key}.keyframe'].to_numpy() for key in self.keys], axis=1)
+        self.offsets = source.offsets
+        self._files = {}
+
+    def _file(self, shard):
+        key = os.getpid(), shard  # DataLoader workers fork; each process opens its own descriptors
+        if key not in self._files:
+            self._files[key] = os.open(self.directory / 'shards' / f'{shard:06d}.bin', os.O_RDONLY)
+        return self._files[key]
+
+    def frames(self, episode, frame):
+        """One av.VideoFrame per camera, in packed camera order, for one frame of an episode."""
+        row = self.offsets[episode] + frame
+        # Each camera decodes from its own latest keyframe; the cameras need not key on the same frames.
+        firsts = first_keyframes(self.keyframe, self.offsets[episode], row)
+        base = self.offset[firsts.min()]
+        data = os.pread(self._file(self.shard[episode]), int(self.offset[row] + self.sizes[row].sum() - base), int(base))
+        decoded = []
+        for camera, first in enumerate(firsts):
+            codec = av.CodecContext.create('h264', 'r')
+            codec.extradata = self.extradata[camera][episode]
+            codec.thread_count = 1
+            output = []
+            for packet_row in range(first, row + 1):
+                start = int(self.offset[packet_row] - base + self.sizes[packet_row, :camera].sum())
+                output += codec.decode(av.Packet(data[start:start + int(self.sizes[packet_row, camera])]))
+            output += codec.decode(None)
+            if len(output) != row - first + 1:
+                raise ValueError(f'{self.directory}: episode {episode} frame {frame} decoded {len(output)} frames')
+            decoded.append(output[-1])
+        return decoded
+
+    def __getstate__(self):
+        return {**self.__dict__, '_files': {}}
+
+
+def first_keyframes(keyframe, start, row):
+    """For each camera, the latest row in [start, row] holding a keyframe (keyframe [rows, cameras])."""
+    window = keyframe[start:row + 1][::-1]
+    if not window.any(axis=0).all():
+        raise ValueError('an episode does not start with a keyframe')
+    return row - window.argmax(axis=0)
+
+
+def packed_directory(packed, root):
+    """<packed>/<source>/<layout> for a dataset at <export>/<source>/<layout>."""
+    directory = Path(packed) / Path(root).parent.name / Path(root).name
+    if not (directory / 'info.json').is_file():
+        raise ValueError(f'{root}: no packed videos at {directory}')
+    return directory
+
+
+class Source:
+    """One dataset root. `packed` is its packed video directory, read instead of the MP4s."""
+
+    def __init__(self, root, packed=None):
         self.root = Path(root)
         self.info = json.loads((self.root / 'meta/info.json').read_text(encoding='utf-8'))
         features = self.info['features']
@@ -100,32 +184,56 @@ class Source:
                    or name.startswith(('data/', 'videos/'))]
         table = pa.concat_tables(pq.read_table(file, columns=columns) for file in files)
         self.episodes = sorted(table.to_pylist(), key=lambda row: row['episode_index'])
-        self.cache = OrderedDict()
+        self._load_states()
+        self.packed = PackedVideos(packed, self) if packed is not None else None
+
+    def _load_states(self):
+        """Read the states and task indices of all episodes once; DataLoader workers share them after fork."""
+        lengths = np.array([row['length'] for row in self.episodes])
+        indices = np.array([row['episode_index'] for row in self.episodes])
+        self.offsets = np.concatenate(([0], np.cumsum(lengths)))
+        files = sorted({(row['data/chunk_index'], row['data/file_index']) for row in self.episodes})
+        paths = [self.root / self.info['data_path'].format(chunk_index=c, file_index=f) for c, f in files]
+        columns = [STATE_KEY, 'episode_index', 'frame_index', 'task_index']
+
+        def read(path):
+            table = pq.read_table(path, columns=columns)
+            episode = np.searchsorted(indices, table['episode_index'].to_numpy())
+            frame = table['frame_index'].to_numpy()
+            if (episode >= len(indices)).any() or (indices[episode] != table['episode_index'].to_numpy()).any() \
+                    or (frame < 0).any() or (frame >= lengths[episode]).any():
+                raise ValueError(f'{path}: frame rows differ from episode metadata')
+            states = table[STATE_KEY].combine_chunks().flatten().to_numpy(zero_copy_only=False)
+            return self.offsets[episode] + frame, states.reshape(-1, STATE_DIM), table['task_index'].to_numpy()
+
+        # Fill preallocated arrays a few files at a time, to bound the peak memory.
+        self.states, self.task_index, filled = None, np.zeros(self.offsets[-1], np.int32), 0
+        with ThreadPoolExecutor(8) as pool:
+            for first in range(0, len(paths), 8):
+                for rows, states, tasks in pool.map(read, paths[first:first + 8]):
+                    if self.states is None:
+                        self.states = np.full((self.offsets[-1], STATE_DIM), np.nan, states.dtype)
+                    self.states[rows], self.task_index[rows] = states, tasks
+                    filled += len(rows)
+        if filled != self.offsets[-1] or np.isnan(self.states[:, 0]).any():
+            raise ValueError(f'{self.root}: frame rows differ from episode metadata')
 
     def episode_id(self, episode):
         row = self.episodes[episode]
         return f"{self.root.parent.name}/{self.root.name}/{row.get('episode_id', row['episode_index'])}"
 
     def frames(self, episode):
-        """(states [N, 26] float64, task_index [N]) of one episode; a few episodes stay cached."""
-        if episode not in self.cache:
-            row = self.episodes[episode]
-            path = self.root / self.info['data_path'].format(
-                chunk_index=row['data/chunk_index'], file_index=row['data/file_index'])
-            table = pq.read_table(path, columns=[STATE_KEY, 'frame_index', 'task_index'],
-                                  filters=[('episode_index', '=', row['episode_index'])])
-            order = np.argsort(table['frame_index'].to_numpy())
-            states = np.stack(table[STATE_KEY].to_numpy(zero_copy_only=False)).astype(np.float64)[order]
-            if len(states) != row['length']:
-                raise ValueError(f'{self.episode_id(episode)}: frame rows differ from episode metadata')
-            self.cache[episode] = states, table['task_index'].to_numpy()[order]
-            if len(self.cache) > 64:
-                self.cache.popitem(last=False)
-        self.cache.move_to_end(episode)
-        return self.cache[episode]
+        """(states [N, 26] float64, task_index [N]) of one episode."""
+        start, stop = self.offsets[episode], self.offsets[episode + 1]
+        return self.states[start:stop].astype(np.float64), self.task_index[start:stop]
 
     def images(self, episode, indices, size, patch=None):
         """RGB views in frame, camera order. Adaptive views can have different shapes."""
+        if self.packed is not None:
+            order = [self.packed.keys.index(f'observation.images.{CAMERAS[c]}') for c in self.cameras]
+            views = [[resize(frames[i], size, patch) for i in order]
+                     for frames in (self.packed.frames(episode, index) for index in indices)]
+            return [tuple(frame) for frame in views] if patch is not None else np.stack([np.stack(f) for f in views])
         row = self.episodes[episode]
         views = []
         for camera in self.cameras:
@@ -207,12 +315,14 @@ class Samples(torch.utils.data.Dataset):
     """Action windows indexed by (draw position, anchor) within the train or val episodes.
 
     `num_refs` fixes the number of reference segments (None draws 0..max_refs);
-    `images=False` skips video decoding, for statistics.
+    `images=False` skips video decoding, for statistics; `packed` is a packed export folder
+    (<packed>/<source>/<layout> for each root) whose videos are read instead of the MP4s.
     """
 
-    def __init__(self, roots, config, split='train', seed=0, num_refs=None, images=True):
+    def __init__(self, roots, config, split='train', seed=0, num_refs=None, images=True, packed=None):
         self.config, self.split, self.seed, self.num_refs, self.with_images = config, split, seed, num_refs, images
-        self.sources = [Source(root) for root in roots]
+        self._pool = self._pool_pid = None
+        self.sources = [Source(root, packed_directory(packed, root) if packed and images else None) for root in roots]
         # Current segments come from `split`; reference segments always from the train episodes of the
         # same dataset, so validation never reads a held-out episode as context.
         self.episodes, self.references = [], [[] for _ in self.sources]
@@ -273,10 +383,26 @@ class Samples(torch.utils.data.Dataset):
         position, anchor = index
         return self.sample(np.random.default_rng([self.seed, position]), anchor=anchor)
 
+    def __getitems__(self, indices):
+        """Load a batch with threads: reading a sample mostly waits on file IO, not on the CPU."""
+        threads = min(self.config.loader_threads, len(indices))
+        if threads <= 1:
+            return [self[index] for index in indices]
+        if self._pool_pid != os.getpid():  # each DataLoader worker builds its own pool
+            self._pool, self._pool_pid = ThreadPoolExecutor(self.config.loader_threads), os.getpid()
+        return list(self._pool.map(self.__getitem__, indices))
 
-def sampled_quantiles(roots, config):
+    def __getstate__(self):
+        return {**self.__dict__, '_pool': None, '_pool_pid': None}
+
+
+def sampled_quantiles(roots, config, samples=None):
     """Estimate raw per-feature bounds from training observations and future actions."""
-    samples = Samples(roots, config, seed=config.seed, images=False)
+    if samples is None:
+        samples = Samples(roots, config, seed=config.seed, images=False)
+    else:  # reuse loaded training samples, without decoding video
+        samples = copy.copy(samples)
+        samples.with_images = False
     rng = np.random.default_rng(config.seed)
     inputs, targets = [], []
     for _ in range(config.stats_samples):
@@ -290,12 +416,14 @@ def sampled_quantiles(roots, config):
     return result
 
 
-def statistics(roots, config):
-    """P1/P99 affine parameters. Rotation coordinates retain their native scale."""
+def statistics(roots, config, samples=None):
+    """P1/P99 affine parameters. Rotation coordinates retain their native scale.
+
+    `samples` may pass already loaded training samples of `roots` (split train, seed config.seed)."""
     if config.rebot_quantile_stats:
         bounds = json.loads(Path(config.rebot_quantile_stats).read_text())['norm_stats']
     else:
-        bounds = sampled_quantiles(roots, config)
+        bounds = sampled_quantiles(roots, config, samples)
     result = {}
     input_dim = STATE_DIM if config.absolute_state else FEATURE_DIM
     for key, group, dim in [('state', 'input', input_dim), ('actions', 'action', FEATURE_DIM)]:

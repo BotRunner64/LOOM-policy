@@ -15,6 +15,13 @@ def test_pad_groups():
     assert mask.tolist() == [[True, True, False], [False] * 3, [True] * 3]
 
 
+def test_patch_matmul_matches_the_convolution(config):
+    model = LoomPolicy(config)
+    pixels = torch.randint(0, 256, (2, 3, 32, 48), dtype=torch.uint8)
+    expected = model.patch(pixels.float() / 127.5 - 1).permute(0, 2, 3, 1)
+    torch.testing.assert_close(model.embed_patches(pixels), expected, atol=1e-5, rtol=1e-5)
+
+
 def make(dataset, config, refs):
     torch.manual_seed(0)
     samples = Samples([dataset], config)
