@@ -33,7 +33,7 @@ torchrun --nproc_per_node 8 -m loom_policy train --data <数据目录>... --outp
 
 ### loom:v2 全量预训练
 
-`configs/loom_v2_pretrain_2b.json` 从头训练 LOOM 2B。六个数据来源均使用零参考段（`max_refs=0`）。每个样本取当前 episode 内最多两帧观测、任务指令和 50 帧动作目标。不留验证集，归一化统计从训练集估计。在 `pretrain-1kh-20261120` 上，一轮遍历 118,639,793 个训练锚点。GBS 512 对应 231,719 次更新，尾批 177 个样本。
+`configs/loom_v2_pretrain_2b.json` 从头训练 LOOM 2B。六个数据来源均使用零参考段（`max_refs=0`）。每个样本取当前 episode 内最多两帧观测、任务指令和 50 帧动作目标。不留验证集，归一化统计从训练集估计。在 `pretrain-1kh-20261120` 上，一轮遍历 118,639,793 个训练锚点。GBS 1024 对应 115,860 次更新，尾批 177 个样本。
 
 WSD 在前 0.005 轮线性预热至 `3e-4`，维持到 0.9 轮，最后 0.1 轮余弦衰减至零。每 50 次更新记录训练指标，每 1,000 次更新和训练结束时更新 `last.pt`。
 
@@ -53,7 +53,23 @@ cd "$work/projects/my_projects/LOOM-policy" && \
     --output "$work/runs/loom-v2-pretrain-2b"
 ```
 
-预设每卡最多 32 个样本，8 卡时每次更新累积 2 轮前反向，每卡 16 个 DataLoader worker，每个 worker 用 16 个线程并行读一个批次。8×H100 实测约 870 samples/s，每步等数据约 2 ms，GPU 利用率 90% 以上，显存峰值 62 GiB，一轮约 38 小时。H200 上可用 `--micro-batch-size 64` 改为一轮前反向；H100 上每卡 64 个样本会显存不足。指令上限为 640 个 UTF-8 字节，这版数据的最长指令为 619 字节。换卡续训时挂载同一数据版本，沿用原输出目录。
+预设每卡最多 32 个样本，8 卡时每次更新累积 4 轮前反向，每卡 16 个 DataLoader worker，每个 worker 用 16 个线程并行读一个批次。8×H100 实测约 920 samples/s，每步等数据约 5 ms，显存峰值 62 GiB，一轮约 36 小时。H200 上可用 `--micro-batch-size 64` 把累积轮数减半；H100 上每卡 64 个样本会显存不足。指令上限为 640 个 UTF-8 字节，这版数据的最长指令为 619 字节。换卡续训时挂载同一数据版本，沿用原输出目录。
+
+多机训练用整机多节点作业（`--nodes 2`，每台 `8,160,1800`）。平台给每台机器注入 `PET_NNODES`、`PET_NODE_RANK`、`PET_MASTER_ADDR`、`PET_MASTER_PORT`；平台自己设的 `RANK`、`WORLD_SIZE` 数的是机器，不是进程，启动前去掉。每台机器运行同一条命令：
+
+```bash
+cd "$work/projects/my_projects/LOOM-policy" && \
+  env -u RANK -u WORLD_SIZE "$work/cache/conda/envs/loom-policy/bin/python" -m torch.distributed.run \
+    --nnodes "$PET_NNODES" --node-rank "$PET_NODE_RANK" \
+    --master-addr "$PET_MASTER_ADDR" --master-port "$PET_MASTER_PORT" \
+    --nproc-per-node=8 --module loom_policy train \
+    --config configs/loom_v2_pretrain_2b.json \
+    --data /inspire/dataset/loom/v2/pretrain-1kh-20261120 \
+    --packed "$public/dataset/LOOM-data/packed/pretrain-1kh-20261120" \
+    --output "$work/runs/loom-v2-pretrain-2b"
+```
+
+16 卡时每卡 32 个样本，累积 2 轮。2×8 H100 实测约 1,610 samples/s，是 8 卡的 1.75 倍，一轮约 20.5 小时。跨机梯度同步走 RoCE，每台 8 张 400 Gb/s 网卡。GBS 512 时 16 卡每卡只有一轮前反向，每步固定的梯度同步和优化器开销摊不开，只有约 1,420 samples/s；梯度改用 bf16 同步只快约 2%，没有采用。
 
 主干的 25 个 Block 在 CUDA 上用 `torch.compile` 编译，启动后前几步较慢；用 `--set compile=false` 关闭。注意力无 mask 时固定用 FlashAttention-2，有 padding mask 的 Reader 交叉注意力用 memory-efficient attention，不用 cuDNN attention：Reader 的 padding 长度每批都变，cuDNN 要为每个新形状重新规划。
 

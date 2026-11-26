@@ -8,7 +8,7 @@
   "max_text_bytes": 640,
   "horizon": 50,
   "epochs": 1,
-  "global_batch_size": 512,
+  "global_batch_size": 1024,
   "batch_size": 32,
   "workers": 16,
   "loader_threads": 16,
