@@ -1,4 +1,4 @@
-"""Offline open-loop evaluation: the same frozen model with different amounts of context."""
+"""Offline open-loop evaluation on the training data: the same frozen model with different amounts of context."""
 import argparse
 import json
 
@@ -43,7 +43,6 @@ def main(argv=None, *, prog=None):
     parser.add_argument('--data', nargs='+', required=True, help='dataset roots or folders of them')
     parser.add_argument('--packed', help='packed export folder (loom-data pack) to read videos from')
     parser.add_argument('--refs', type=int, nargs='+', default=[0], help='numbers of reference segments to evaluate (default: 0)')
-    parser.add_argument('--split', default='val', choices=('train', 'val'))
     parser.add_argument('--batches', type=int, default=32)
     parser.add_argument('--batch-size', type=int, default=16)
     args = parser.parse_args(argv)
@@ -51,8 +50,7 @@ def main(argv=None, *, prog=None):
     model = load_model(args.checkpoint, device)
     roots = find_datasets(args.data)
     for refs in args.refs:
-        samples = Samples(roots, model.config, split=args.split, seed=model.config.seed, num_refs=refs,
-                          packed=args.packed)
+        samples = Samples(roots, model.config, seed=model.config.seed, num_refs=refs, packed=args.packed)
         print(json.dumps({'refs': refs, **evaluate(model, samples, args.batches, args.batch_size, device)}))
 
 

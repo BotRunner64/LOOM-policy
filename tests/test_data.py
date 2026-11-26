@@ -20,11 +20,12 @@ def test_find_datasets(dataset):
 
 
 def test_video_frames_match_rows(dataset):
-    images = Source(dataset).images(3, [0, 7, 30, 59], (48, 64))
-    assert images.shape == (4, 3, 48, 64, 3)
+    # A 64 x 64 budget with one-pixel patches keeps every camera at its native size.
+    images = Source(dataset).images(3, [0, 7, 30, 59], (64, 64), 1)
+    assert [view.shape for view in images[0]] == [(48, 64, 3), (64, 48, 3), (32, 32, 3)]
     for i, frame in enumerate([0, 7, 30, 59]):
-        for camera in range(3):
-            assert identify(images[i, camera]) == (frame, camera)
+        for camera, view in enumerate(images[i]):
+            assert identify(view) == (frame, camera)
 
 
 @pytest.mark.parametrize('native,expected', [
@@ -76,19 +77,16 @@ def test_long_instruction_is_an_error(dataset, config):
         Samples([dataset], config).segment(CURRENT, 0, 1, 10, 2)
 
 
-def test_split_and_statistics(dataset, config):
-    config.val_fraction = 0.5
-    train, val = (Samples([dataset], config, split=split) for split in ('train', 'val'))
-    assert sorted(e for _, e, _ in train.episodes + val.episodes) == [0, 1, 2, 3, 4]
-    assert train.episodes and val.episodes
-    # References of both splits are train episodes, and never the episode of the current segment.
-    assert val.references == train.references == [[(e, n) for _, e, n in train.episodes]]
-    val.num_refs = len(train.episodes)
-    sample = val.sample(np.random.default_rng(0))
-    assert len(sample['segments']) == 1 + len(train.episodes)
-    train.num_refs = len(train.episodes)
+def test_references_and_statistics(dataset, config):
+    samples = Samples([dataset], config)
+    assert sorted(e for _, e, _ in samples.episodes) == [0, 1, 2, 3, 4]
+    # Every episode of the dataset can be a reference, except the episode of the current segment.
+    assert samples.references == [[(e, n) for _, e, n in samples.episodes]]
+    samples.num_refs = len(samples.episodes) - 1
+    assert len(samples.sample(np.random.default_rng(0))['segments']) == len(samples.episodes)
+    samples.num_refs = len(samples.episodes)
     with pytest.raises(ValueError, match='references asked'):
-        train.sample(np.random.default_rng(0))
+        samples.sample(np.random.default_rng(0))
     stats = statistics([dataset], config)
     assert all(len(stats[key]) == 20 for key in ('input_center', 'input_scale', 'action_center', 'action_scale'))
     rng = np.random.default_rng(config.seed)
@@ -122,10 +120,7 @@ def test_rebot_quantile_statistics(config, tmp_path):
 def test_threaded_batch_matches_single_samples(dataset, config):
     samples = Samples([dataset], config)
     indices = [(position, position % int(samples.cumulative[-1])) for position in range(7)]
-    config.loader_threads = 4
-    threaded = samples.__getitems__(indices)
-    config.loader_threads = 1
-    for together, alone in zip(threaded, samples.__getitems__(indices), strict=True):
+    for together, alone in zip(samples.__getitems__(indices), [samples[i] for i in indices], strict=True):
         torch.testing.assert_close(together['target'], alone['target'])
         for a, b in zip(together['segments'], alone['segments'], strict=True):
             torch.testing.assert_close(a['state'], b['state'])
@@ -135,13 +130,11 @@ def test_threaded_batch_matches_single_samples(dataset, config):
 def test_packed_videos_match_the_mp4s(dataset, packed, config):
     mp4, fast = Samples([dataset], config), Samples([dataset], config, packed=packed)
     assert fast.sources[0].packed is not None
-    for size, patch in ((config.image_size, config.patch), (config.image_size, None)):
-        for episode, row in enumerate(mp4.sources[0].episodes):
-            frames = list(range(row['length']))
-            for a, b in zip(mp4.sources[0].images(episode, frames, size, patch),
-                            fast.sources[0].images(episode, frames, size, patch), strict=True):
-                assert all(np.array_equal(x, y) for x, y in zip(a, b, strict=True))
-    config.loader_threads = 4
+    for episode, row in enumerate(mp4.sources[0].episodes):
+        frames = list(range(row['length']))
+        for a, b in zip(mp4.sources[0].images(episode, frames, config.image_size, config.patch),
+                        fast.sources[0].images(episode, frames, config.image_size, config.patch), strict=True):
+            assert all(np.array_equal(x, y) for x, y in zip(a, b, strict=True))
     indices = [(i, i * 7 % int(mp4.cumulative[-1])) for i in range(6)]
     for x, y in zip(mp4.__getitems__(indices), fast.__getitems__(indices), strict=True):
         assert all(torch.equal(p, q) for a, b in zip(x['segments'], y['segments']) for fa, fb in

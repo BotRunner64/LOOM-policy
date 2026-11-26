@@ -2,7 +2,6 @@
   "absolute_state": true,
   "current_frames": 1,
   "batch_size": 16,
-  "eval_batches": 32,
   "max_refs": 0,
   "max_prefix_len": 6
 }

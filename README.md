@@ -8,7 +8,7 @@
 
 没有参考时主干接收 306 个 token，有参考时接收 562 个。`num_latents` 同时设置当前段和全部参考的预算。
 
-新训练默认按每路 RGB 图像的原始宽高比缩放，高宽取整到 patch 的倍数。`image_size` 定义位置嵌入的基准网格和每张图的像素预算。默认 `192×256`、patch 边长 16，即每张图最多 192 个视觉 token。训练和部署共用缩放规则，`Policy.act` 和 `set_references` 都接受按帧、相机排列的不同尺寸 RGB 数组。训练也可通过 `--set adaptive_rgb=false` 选用固定尺寸。
+每路 RGB 图像按原始宽高比缩放，高宽取整到 patch 的倍数。`image_size` 定义位置嵌入的基准网格和每张图的像素预算。默认 `192×256`、patch 边长 16，即每张图最多 192 个视觉 token。训练和部署共用缩放规则，`Policy.act` 和 `set_references` 都接受按帧、相机排列的不同尺寸 RGB 数组。
 
 ## 环境
 
@@ -33,11 +33,11 @@ torchrun --nproc_per_node 8 -m loom_policy train --data <数据目录>... --outp
 
 ### loom:v2 全量预训练
 
-`configs/loom_v2_pretrain_2b.json` 从头训练 LOOM 2B。六个数据来源均使用零参考段（`max_refs=0`）。每个样本取当前 episode 内最多两帧观测、任务指令和 50 帧动作目标。不留验证集，归一化统计从训练集估计。在 `pretrain-1kh-20261120` 上，一轮遍历 118,639,793 个训练锚点。GBS 1024 对应 115,860 次更新，尾批 177 个样本。
+`configs/loom_v2_pretrain_2b.json` 从头训练 LOOM 2B。六个数据来源均使用零参考段（`max_refs=0`）。每个样本取当前 episode 内最多两帧观测、任务指令和 50 帧动作目标。归一化统计从训练样本估计。在 `pretrain-1kh-20261120` 上，一轮遍历 118,639,793 个训练锚点。GBS 1024 对应 115,860 次更新，尾批 177 个样本。
 
 WSD 在前 0.005 轮线性预热至 `3e-4`，维持到 0.9 轮，最后 0.1 轮余弦衰减至零。每 50 次更新记录训练指标，每 1,000 次更新和训练结束时更新 `last.pt`。
 
-训练从 LOOM-data 的打包视频读取图像（`loom-data pack`，格式见 LOOM-data 的打包格式契约）。`--packed` 指向打包根目录，其下每个数据集对应 `<源>/<布局>`；state、指令和 episode 元数据仍从 `--data` 的导出数据读取。打包数据与导出数据不一致时训练拒绝启动。不给 `--packed` 时逐个打开 MP4，在共享盘上加载跟不上 GPU。
+训练从 LOOM-data 的打包视频读取图像（`loom-data pack`，格式见 LOOM-data 的打包格式契约）。`--packed` 指向打包根目录，其下每个数据集对应 `<源>/<布局>`；state、指令和 episode 元数据仍从 `--data` 的导出数据读取。打包数据与导出数据不一致时训练拒绝启动。
 
 在启智 PHASE-X 项目提交普通优先级的单机 8 卡作业，挂载 `--dataset loom:v2`，项目公共目录挂载为只读。打包数据在项目的 qb-ilm2 盘上，checkpoint 和日志写入全局个人盘。
 
@@ -69,9 +69,9 @@ cd "$work/projects/my_projects/LOOM-policy" && \
     --output "$work/runs/loom-v2-pretrain-2b"
 ```
 
-16 卡时每卡 32 个样本，累积 2 轮。2×8 H100 实测约 1,610 samples/s，是 8 卡的 1.75 倍，一轮约 20.5 小时。跨机梯度同步走 RoCE，每台 8 张 400 Gb/s 网卡。GBS 512 时 16 卡每卡只有一轮前反向，每步固定的梯度同步和优化器开销摊不开，只有约 1,420 samples/s；梯度改用 bf16 同步只快约 2%，没有采用。
+16 卡时每卡 32 个样本，累积 2 轮。2×8 H100 实测约 1,610 samples/s，是 8 卡的 1.75 倍，一轮约 20.5 小时。跨机梯度同步走 RoCE，每台 8 张 400 Gb/s 网卡。
 
-主干的 25 个 Block 在 CUDA 上用 `torch.compile` 编译，启动后前几步较慢；用 `--set compile=false` 关闭。注意力无 mask 时固定用 FlashAttention-2，有 padding mask 的 Reader 交叉注意力用 memory-efficient attention，不用 cuDNN attention：Reader 的 padding 长度每批都变，cuDNN 要为每个新形状重新规划。
+主干在 CUDA 上用 `torch.compile` 编译，启动后前几步较慢。
 
 ### Packing 单任务训练
 
@@ -88,10 +88,10 @@ torchrun --nproc_per_node 8 -m loom_policy train --config configs/rebot_packing_
 
 下一段可用 `--stop-at-epoch 50` 在第 50 轮结束后保存。轮内中断也可以从最近的 checkpoint 接着训练。稳定阶段可用 `--wsd-end-epoch` 调整计划总轮数，衰减仍占最后 10 轮。
 
-离线评估默认使用零参考段。Packing 使用全量 episode 训练，下面在训练集上检查拟合情况。
+离线评估在训练数据上检查拟合情况，默认使用零参考段。
 
 ```bash
-loom-policy eval --checkpoint runs/packing-wsd/last.pt --data <packing数据目录> --split train
+loom-policy eval --checkpoint runs/packing-wsd/last.pt --data <packing数据目录>
 ```
 
 部署用 `loom_policy.policy.Policy`：`set_references` 把参考编码一次，`act` 每步返回未来 50 帧的目标位姿。
@@ -114,7 +114,7 @@ Packing 预设从相邻的 openpi_rebot 仓库读取 P1/P99 统计文件，每 5
 
 ### 动作前缀
 
-训练时每个样本均匀抽取 0 到 `max_prefix_len` 帧作为前缀，默认上限为 4，至少留一帧用于预测。可按推理延迟对应的控制帧数调整上限。已知槽使用归一化动作的线性投影，待预测槽使用可学习的槽向量，两者都加上对应的时间编码。常规验证指标使用空前缀。训练和部署需要包含动作投影层的 checkpoint。
+训练时每个样本均匀抽取 0 到 `max_prefix_len` 帧作为前缀，默认上限为 4，至少留一帧用于预测。可按推理延迟对应的控制帧数调整上限。已知槽使用归一化动作的线性投影，待预测槽使用可学习的槽向量，两者都加上对应的时间编码。离线评估使用空前缀。训练和部署需要包含动作投影层的 checkpoint。
 
 部署时传入从当前观测的下一帧起、队列里已承诺的连续目标位姿，形状为 `[d, 26]`，坐标系与当前观测一致。返回完整 chunk，前 `d` 帧原样保留，队列从 `chunk[d:]` 接上新动作。
 

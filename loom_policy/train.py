@@ -15,7 +15,6 @@ from torch.nn.parallel import DistributedDataParallel
 
 from loom_policy.config import Config
 from loom_policy.data import Samples, batch_to, collate, find_datasets, statistics
-from loom_policy.eval import evaluate
 from loom_policy.model import LoomPolicy
 
 
@@ -96,7 +95,7 @@ def main(argv=None, *, prog=None):
     checkpoint = args.output / 'last.pt'
     state = torch.load(checkpoint, map_location='cpu', weights_only=True, mmap=True) if checkpoint.exists() else None
     # The plan travels with the checkpoint. Job limits apply only to this invocation.
-    config = Config(**state['config']) if state else Config.load(args.config, args.set)
+    config = Config.from_checkpoint(state['config']) if state else Config.load(args.config, args.set)
     step = state['step'] if state else 0
     cap = config.batch_size if args.micro_batch_size is None else args.micro_batch_size
     global_batch = config.global_batch_size
@@ -137,7 +136,7 @@ def main(argv=None, *, prog=None):
     # DDP broadcasts rank zero's normalization buffers when wrapping the model.
     stats = statistics(roots, config, train_samples) if state is None and rank == 0 else None
     model = LoomPolicy(config, stats).to(device)
-    if cuda and config.compile:
+    if cuda:
         # Trunk blocks have one fixed shape per micro-batch size; the reader's padded shapes vary, so it stays eager.
         for block in model.trunk:
             block.compile()
@@ -157,7 +156,6 @@ def main(argv=None, *, prog=None):
         (args.output / 'config.json').write_text(json.dumps(config.to_dict(), indent=2) + '\n')
         print(f'{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters, '
               f'{len(roots)} datasets, step {step}/{total_steps}', flush=True)
-        validation = Samples(roots, config, split='val', seed=config.seed, packed=args.packed) if config.val_fraction else None
 
     batches = layout.index_batches(step, stop, world, rank, cap, config.seed)
     loader = iter(torch.utils.data.DataLoader(
@@ -207,9 +205,6 @@ def main(argv=None, *, prog=None):
             window.zero_()
         if rank:
             continue
-        if validation and (step % config.eval_every == 0 or step == total_steps):
-            metrics = evaluate(model, validation, config.eval_batches, config.batch_size, device)
-            record.update({f'val_{key}': value for key, value in metrics.items()})
         if record:
             record = {'step': step, **record}
             print(json.dumps(record), flush=True)

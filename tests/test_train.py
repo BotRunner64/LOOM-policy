@@ -90,7 +90,7 @@ def test_wsd_changed_world_resume(dataset, tmp_path, config):
 def test_rebot_single_absolute_state(dataset, tmp_path):
     preset = Path(__file__).resolve().parents[1] / 'configs/rebot_observation.json'
     config = Config.load(preset, ['dim=32', 'trunk_dim=32', 'trunk_heads=2', 'trunk_layers=1',
-                                 'num_latents=4', 'val_fraction=0', 'stats_samples=8'])
+                                 'num_latents=4', 'stats_samples=8'])
     samples = Samples([dataset], config)
     sample = samples.sample(np.random.default_rng(0))
     segment, = sample['segments']
@@ -125,9 +125,9 @@ def test_rebot_single_absolute_state(dataset, tmp_path):
 
 
 def test_train_resume_evaluate_and_act(dataset, tmp_path, config, monkeypatch):
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)  # a tiny model; CPU keeps it compiler-free
     config.trunk_dim, config.trunk_heads = config.dim, config.heads
-    config.val_fraction = 0.4
-    config.eval_batches = config.epochs = 1
+    config.epochs = 1
     config.log_every = config.save_every = 2
     config.global_batch_size = 8
     path = tmp_path / 'plan.json'
@@ -147,12 +147,12 @@ def test_train_resume_evaluate_and_act(dataset, tmp_path, config, monkeypatch):
     assert first['step'] == 2 and first['consumed_samples'] == 16 < first['epoch_size']
     train.main(args)
     records = [json.loads(line) for line in (tmp_path / 'metrics.jsonl').read_text().splitlines()]
-    assert records[-1]['epoch'] == 1 and 'val_translation_m' in records[-1]
+    assert records[-1]['epoch'] == 1
     assert [r['step'] for r in records] == sorted({r['step'] for r in records})
 
     model = load_model(tmp_path / 'last.pt', torch.device('cpu'))
     assert 0 < model.action_scale.min() < 1  # statistics travel with the checkpoint
-    metrics = evaluate(model, Samples([dataset], model.config, split='val', num_refs=1), 1, 2, torch.device('cpu'))
+    metrics = evaluate(model, Samples([dataset], model.config, num_refs=1), 1, 2, torch.device('cpu'))
     assert set(metrics) == {'loss', 'translation_m', 'rotation_deg', 'gripper'}
 
     policy = Policy(tmp_path / 'last.pt', 'cpu')
@@ -192,19 +192,8 @@ def test_train_resume_evaluate_and_act(dataset, tmp_path, config, monkeypatch):
                             'cameras': cameras, 'instruction': 'pick the cup'}])
     assert np.abs(policy.act(states[[20, 23]], images, cameras, 'pick the cup', previous=states[17]) - without).max() > 0
 
-    # The same raw views use the historical fixed-size processor for an old checkpoint.
-    del first['config']['adaptive_rgb']
-    del first['config']['share_reference_budget']
-    del first['config']['trunk_dim']
-    del first['config']['trunk_heads']
-    torch.save(first, tmp_path / 'legacy.pt')
-    legacy = Policy(tmp_path / 'legacy.pt', 'cpu')
-    segment = legacy.segment(0, states[[20, 23]], images, cameras, 'pick the cup')
-    assert all(view.shape == (3, 32, 48) for frame in segment['images'] for view in frame)
-    reference = {'states': reference_states[frames], 'images': source.images(2, frames, (48, 64)),
+    reference = {'states': reference_states[frames], 'images': source.images(2, frames, (64, 64), patch=1),
                  'cameras': cameras, 'instruction': 'pick the cup'}
-    legacy.set_references([reference, reference])
-    assert legacy.references.shape == (2, 4, 32)
     policy.set_references([reference, reference])
     assert [len(x) for x in policy.references] == [2, 2]
     assert policy.act(states[[20, 23]], images, cameras, 'pick the cup').shape == (8, 26)

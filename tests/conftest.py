@@ -135,4 +135,4 @@ def config():
     return Config(image_size=(32, 48), obs_stride=3, current_frames=2, ref_frames=5, max_refs=2, horizon=8,
                   dim=32, heads=2, num_latents=4, reader_blocks=1, reader_self_layers=1,
                   trunk_dim=64, trunk_heads=4, trunk_layers=2,
-                  val_fraction=0., stats_samples=20, batch_size=3, workers=0, compile=False)
+                  stats_samples=20, batch_size=3, workers=0)

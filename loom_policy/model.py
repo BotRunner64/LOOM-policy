@@ -127,7 +127,7 @@ class LoomPolicy(nn.Module):
         budget = self.config.num_latents
         groups, references = defaultdict(list), defaultdict(list)
         for index, (kind, sample) in enumerate(zip(seg_kind.tolist(), seg_sample.tolist(), strict=True)):
-            if kind == REFERENCE and self.config.share_reference_budget:
+            if kind == REFERENCE:
                 references[sample].append(index)
             else:
                 groups[kind, budget].append(index)
@@ -149,7 +149,7 @@ class LoomPolicy(nn.Module):
         return F.linear(pixels.permute(0, 2, 4, 1, 3, 5).flatten(3), self.patch.weight.flatten(1), self.patch.bias)
 
     def encode(self, batch):
-        """One [query count, dim] tensor per segment, in input order. Legacy checkpoints return a stack."""
+        """One [query count, dim] tensor per segment, in input order."""
         kind = batch['seg_kind']
         tokens, group = [], []
         base_grid = tuple(size // self.config.patch for size in self.config.image_size)
@@ -191,7 +191,7 @@ class LoomPolicy(nn.Module):
                     read = layer(read)
             for index, result in zip(indices, self.reader_norm(read).unbind(), strict=True):
                 latents[index] = result
-        return tuple(latents) if self.config.share_reference_budget else torch.stack(latents)
+        return tuple(latents)
 
     def decode(self, latents, seg_sample, seg_kind, samples, prefix_norm=None, prefix_mask=None):
         """Decode actions, optionally replacing slots selected by prefix_mask with normalized actions.

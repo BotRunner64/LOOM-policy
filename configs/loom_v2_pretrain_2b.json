@@ -11,12 +11,10 @@
   "global_batch_size": 1024,
   "batch_size": 32,
   "workers": 16,
-  "loader_threads": 16,
   "lr": 0.0003,
   "warmup_epochs": 0.005,
   "decay_epochs": 0.1,
   "seed": 0,
-  "val_fraction": 0.0,
   "log_every": 50,
   "save_every": 1000
 }

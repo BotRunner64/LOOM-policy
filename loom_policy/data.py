@@ -13,7 +13,6 @@ import json
 import math
 import os
 from pathlib import Path
-import zlib
 
 import av
 import numpy as np
@@ -27,6 +26,7 @@ FPS = 30
 STATE_KEY = 'observation.state'
 CAMERAS = ('top', 'left_wrist', 'right_wrist')
 CURRENT, REFERENCE = 0, 1
+LOADER_THREADS = 16    # threads of each DataLoader worker reading the samples of one batch
 
 
 def find_datasets(paths):
@@ -43,8 +43,6 @@ def find_datasets(paths):
 
 def rgb_size(height, width, size, patch):
     """Choose a patch-aligned H x W, retaining native scale up to the configured area."""
-    if patch is None:
-        return size
     max_pixels = math.prod(size)
     budget = max_pixels // patch**2
     scale = min(1., math.sqrt(max_pixels / (height * width))) / patch
@@ -57,7 +55,7 @@ def rgb_size(height, width, size, patch):
     return rows * patch, cols * patch
 
 
-def resize(image, size, patch=None):
+def resize(image, size, patch):
     """Resize a decoded frame or a deployment RGB array with the same swscale operation."""
     if not isinstance(image, av.VideoFrame):
         image = av.VideoFrame.from_ndarray(np.ascontiguousarray(image), format='rgb24')
@@ -65,7 +63,7 @@ def resize(image, size, patch=None):
     return image.to_ndarray(width=width, height=height, format='rgb24')
 
 
-def read_frames(path, indices, size, patch=None):
+def read_frames(path, indices, size, patch):
     """Selected frames of a single camera as [N, H, W, 3] uint8."""
     frames = []
     with av.open(str(path)) as container:
@@ -227,13 +225,12 @@ class Source:
         start, stop = self.offsets[episode], self.offsets[episode + 1]
         return self.states[start:stop].astype(np.float64), self.task_index[start:stop]
 
-    def images(self, episode, indices, size, patch=None):
-        """RGB views in frame, camera order. Adaptive views can have different shapes."""
+    def images(self, episode, indices, size, patch):
+        """RGB views in frame, camera order: one tuple of H x W x 3 arrays per frame; shapes can differ."""
         if self.packed is not None:
             order = [self.packed.keys.index(f'observation.images.{CAMERAS[c]}') for c in self.cameras]
-            views = [[resize(frames[i], size, patch) for i in order]
-                     for frames in (self.packed.frames(episode, index) for index in indices)]
-            return [tuple(frame) for frame in views] if patch is not None else np.stack([np.stack(f) for f in views])
+            return [tuple(resize(frames[i], size, patch) for i in order)
+                    for frames in (self.packed.frames(episode, index) for index in indices)]
         row = self.episodes[episode]
         views = []
         for camera in self.cameras:
@@ -243,9 +240,7 @@ class Source:
                 file_index=row[f'videos/{key}/file_index'])
             start = round(row[f'videos/{key}/from_timestamp'] * FPS)
             views.append(read_frames(path, [start + i for i in indices], size, patch))
-        if patch is not None:
-            return list(zip(*views, strict=True))
-        return np.stack(views, axis=1)
+        return list(zip(*views, strict=True))
 
 
 def make_segment(kind, features, offsets, texts, images=None, cameras=(), max_text_bytes=256):
@@ -312,30 +307,24 @@ def batch_to(batch, device):
 
 
 class Samples(torch.utils.data.Dataset):
-    """Action windows indexed by (draw position, anchor) within the train or val episodes.
+    """Action windows indexed by (draw position, anchor) over all episodes longer than the horizon.
 
     `num_refs` fixes the number of reference segments (None draws 0..max_refs);
     `images=False` skips video decoding, for statistics; `packed` is a packed export folder
     (<packed>/<source>/<layout> for each root) whose videos are read instead of the MP4s.
     """
 
-    def __init__(self, roots, config, split='train', seed=0, num_refs=None, images=True, packed=None):
-        self.config, self.split, self.seed, self.num_refs, self.with_images = config, split, seed, num_refs, images
+    def __init__(self, roots, config, seed=0, num_refs=None, images=True, packed=None):
+        self.config, self.seed, self.num_refs, self.with_images = config, seed, num_refs, images
         self._pool = self._pool_pid = None
         self.sources = [Source(root, packed_directory(packed, root) if packed and images else None) for root in roots]
-        # Current segments come from `split`; reference segments always from the train episodes of the
-        # same dataset, so validation never reads a held-out episode as context.
-        self.episodes, self.references = [], [[] for _ in self.sources]
-        threshold = round(config.val_fraction * 10000)
-        for number, source in enumerate(self.sources):
-            for episode, row in enumerate(source.episodes):
-                held_out = zlib.crc32(source.episode_id(episode).encode()) % 10000 < threshold
-                if not held_out:
-                    self.references[number].append((episode, row['length']))
-                if row['length'] > config.horizon and held_out == (split == 'val'):
-                    self.episodes.append((number, episode, row['length']))
+        # Reference segments are windows of the other episodes of the same dataset.
+        self.references = [[(episode, row['length']) for episode, row in enumerate(source.episodes)]
+                           for source in self.sources]
+        self.episodes = [(number, episode, row['length']) for number, source in enumerate(self.sources)
+                         for episode, row in enumerate(source.episodes) if row['length'] > config.horizon]
         if not self.episodes:
-            raise ValueError(f'No {split} episodes longer than {config.horizon} frames')
+            raise ValueError(f'No episodes longer than {config.horizon} frames')
         # Every frame t with a full horizon after it is equally likely.
         self.cumulative = np.cumsum([length - config.horizon for _, _, length in self.episodes])
 
@@ -350,8 +339,7 @@ class Samples(torch.utils.data.Dataset):
             features = relative(states[np.maximum(frames - config.obs_stride, 0)], features)
         changes = [i for i in range(len(frames)) if i == 0 or tasks[frames[i]] != tasks[frames[i - 1]]]
         texts = [(frames[i] - end, source.tasks[int(tasks[frames[i]])]) for i in changes]
-        patch = config.patch if config.adaptive_rgb else None
-        images = source.images(episode, frames.tolist(), config.image_size, patch) if self.with_images else None
+        images = source.images(episode, frames.tolist(), config.image_size, config.patch) if self.with_images else None
         return make_segment(kind, features, frames - end, texts, images, source.cameras, config.max_text_bytes)
 
     def sample(self, rng, anchor=None):
@@ -365,7 +353,7 @@ class Samples(torch.utils.data.Dataset):
         segments = [self.segment(CURRENT, number, episode, t, config.current_frames)]
         # Draw one spare, so that dropping the current episode still leaves `count` (no scan of the pool).
         pool = self.references[number]
-        available = len(pool) - (self.split == 'train')
+        available = len(pool) - 1  # the pool holds the current episode too
         count = int(rng.integers(config.max_refs + 1)) if self.num_refs is None else self.num_refs
         if self.num_refs is not None and count > available:
             raise ValueError(f'{self.sources[number].root}: {count} references asked, {available} episodes to draw from')
@@ -385,11 +373,10 @@ class Samples(torch.utils.data.Dataset):
 
     def __getitems__(self, indices):
         """Load a batch with threads: reading a sample mostly waits on file IO, not on the CPU."""
-        threads = min(self.config.loader_threads, len(indices))
-        if threads <= 1:
-            return [self[index] for index in indices]
+        if len(indices) == 1:
+            return [self[indices[0]]]
         if self._pool_pid != os.getpid():  # each DataLoader worker builds its own pool
-            self._pool, self._pool_pid = ThreadPoolExecutor(self.config.loader_threads), os.getpid()
+            self._pool, self._pool_pid = ThreadPoolExecutor(LOADER_THREADS), os.getpid()
         return list(self._pool.map(self.__getitem__, indices))
 
     def __getstate__(self):
@@ -419,7 +406,7 @@ def sampled_quantiles(roots, config, samples=None):
 def statistics(roots, config, samples=None):
     """P1/P99 affine parameters. Rotation coordinates retain their native scale.
 
-    `samples` may pass already loaded training samples of `roots` (split train, seed config.seed)."""
+    `samples` may pass already loaded training samples of `roots` (seed config.seed)."""
     if config.rebot_quantile_stats:
         bounds = json.loads(Path(config.rebot_quantile_stats).read_text())['norm_stats']
     else:
