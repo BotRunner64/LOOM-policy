@@ -19,7 +19,7 @@ from loom_policy.model import LoomPolicy
 
 
 def test_gbs128_partitions():
-    for cap in (1, 8):
+    for cap in (1, 8, 16):
         for world in range(2, 65):
             groups = [train.micro_batches(128, world, rank, cap) for rank in range(world)]
             assert len({len(rank_groups) for rank_groups in groups}) == 1

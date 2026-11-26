@@ -62,7 +62,7 @@ torchrun --nproc_per_node 8 -m loom_policy train --config configs/rebot_packing_
   --data <packing数据目录> --output runs/packing-wsd --stop-at-epoch 25
 ```
 
-续训时使用同一输出目录，以及相同的数据和数据目录顺序。按每卡最多 8 个样本，2、4、8、16 卡分别累积 8、4、2、1 次；32、64 卡分别每卡取 4、2 个样本，均更新一次。其他卡数按 rank 均分余数；可用 `--micro-batch-size` 调低本次作业的上限。采样位置和 RTC 前缀由已提交的全局更新确定，跨卡数或 worker 数恢复时可接回同一批数据。
+续训时使用同一输出目录，以及相同的数据和数据目录顺序。预设每卡最多 16 个样本。GBS 128 的完整更新在 2、4、8 卡上分别需要 4、2、1 轮前反向。16、32、64 卡均只需一轮，每卡分别取 8、4、2 个样本。其他卡数按 rank 均分余数。可用 `--micro-batch-size` 设置本次作业的每卡上限。采样位置和 RTC 前缀由已提交的全局更新确定，跨卡数或 worker 数恢复时可接回同一批数据。
 
 下一段可用 `--stop-at-epoch 50` 在第 50 轮结束后保存。轮内中断也可以从最近的 checkpoint 接着训练。稳定阶段可用 `--wsd-end-epoch` 调整计划总轮数，衰减仍占最后 10 轮。
 
